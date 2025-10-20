@@ -302,11 +302,12 @@ We also provide several complete examples in the **demo** folder.
 ## 💪🏻 Training
 
 ### 📚 SFT
-1. Please refer to [VLM2Vec](https://github.com/TIGER-AI-Lab/VLM2Vec/blob/main/experiments/public/data/download_data.sh) to download the image and video. Then, please organize the dataset in the following directory structure before training:
+1. Please refer to [VLM2Vec](https://github.com/TIGER-AI-Lab/VLM2Vec/blob/main/experiments/public/data/download_data.sh) to download the image and video. In addition, please copy the image **UME-R1/assets/blank.jpg** to **MMEB-train/images**. Then, please organize the dataset in the following directory structure before training:
 
 ```bash
 MMEB-train/
 ├── images/ # MMEB-V1
+    ├── blank.jpg # copy from UME-R1/assets/blank.jpg
 ├── llavahound/
 ├── vidore/
 └── visrag/
