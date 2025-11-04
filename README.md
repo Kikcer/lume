@@ -1,13 +1,13 @@
 # UME-R1: Exploring Reasoning-Driven Generative Multimodal Embeddings
 
-<font size=4><div align='center' > [[🤗 UME-R1-2B](https://huggingface.co/zhibinlan/UME-R1-2B)] [[🤗 UME-R1-7B](https://huggingface.co/zhibinlan/UME-R1-7B)]  [[🤗 SFT Data](https://huggingface.co/datasets/omlab/VLM-R1)] [[🤗 RL Data](https://huggingface.co/datasets/omlab/VLM-R1)] [[📝 arXiv](https://)] </div></font>
+<font size=4><div align='center' > [[🤗 UME-R1-2B](https://huggingface.co/zhibinlan/UME-R1-2B)] [[🤗 UME-R1-7B](https://huggingface.co/zhibinlan/UME-R1-7B)]  [[🤗 SFT Data](https://huggingface.co/datasets/omlab/VLM-R1)] [[🤗 RL Data](https://huggingface.co/datasets/omlab/VLM-R1)] [[📝 arXiv](https://arxiv.org/abs/2511.00405)] </div></font>
 
 This repo contains the code and model for UME-R1: Exploring Reasoning-Driven Generative Multimodal Embeddings, we have developed a series of powerful generative multimodal embedding models that can encode inputs texts, images, and videos. In particular, UME-R1 can generate either discriminative or generative embeddings as needed, and the generative embeddings possess the potential for test-time scaling.
 
 <img src="assets/Overview.png" alt="Model Overview" width="800" height="auto">
 
 ## 🗞️ Release Notes
-[2025/10/10] 🚀 We’re thrilled to release the UME-R1 series! The paper, trained models, and code are now open to the community.
+[2025/11/04] 🚀 We’re thrilled to release the UME-R1 series! The paper, trained models, and code are now open to the community.
 
 ## Model Performance
 UME-R1 significantly outperforms discriminative embeddings and can provide discriminative or generative representations as needed. Its oracle performance—selecting the best between discriminative and generative—far exceeds using either mode alone.
@@ -546,9 +546,9 @@ echo "✅ All jobs completed."
 We would like to express our sincere gratitude to [VLM-R1](https://github.com/om-ai-lab/VLM-R1), [QwenVL](https://github.com/QwenLM/Qwen3-VL), and [VLM2Vec](https://github.com/TIGER-AI-Lab/VLM2Vec) for providing open-source resources that contributed to the development of this project.
 
 
-
+<!-- 
 ## ⭐️ Citation
 If you find this project useful, welcome to cite us.
 ```bib
 
-```
+``` -->
