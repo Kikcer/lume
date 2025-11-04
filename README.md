@@ -1,6 +1,6 @@
 # UME-R1: Exploring Reasoning-Driven Generative Multimodal Embeddings
 
-<font size=4><div align='center' > [[🤗 UME-R1-2B](https://huggingface.co/zhibinlan/UME-R1-2B)] [[🤗 UME-R1-7B](https://huggingface.co/zhibinlan/UME-R1-7B)]  [[🤗 SFT Data](https://huggingface.co/datasets/omlab/VLM-R1)] [[🤗 RL Data](https://huggingface.co/datasets/omlab/VLM-R1)] [[📝 arXiv](https://arxiv.org/abs/2511.00405)] </div></font>
+<font size=4><div align='center' > [[🤗 UME-R1-2B](https://huggingface.co/zhibinlan/UME-R1-2B)] [[🤗 UME-R1-7B](https://huggingface.co/zhibinlan/UME-R1-7B)]  [[🤗 SFT Data](https://huggingface.co/datasets/zhibinlan/UME-sft-train)] [[🤗 RL Data](https://huggingface.co/datasets/zhibinlan/UME-rl-train)] [[📝 arXiv](https://arxiv.org/abs/2511.00405)] </div></font>
 
 This repo contains the code and model for UME-R1: Exploring Reasoning-Driven Generative Multimodal Embeddings, we have developed a series of powerful generative multimodal embedding models that can encode inputs texts, images, and videos. In particular, UME-R1 can generate either discriminative or generative embeddings as needed, and the generative embeddings possess the potential for test-time scaling.
 
