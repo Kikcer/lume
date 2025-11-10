@@ -546,9 +546,13 @@ echo "✅ All jobs completed."
 We would like to express our sincere gratitude to [VLM-R1](https://github.com/om-ai-lab/VLM-R1), [QwenVL](https://github.com/QwenLM/Qwen3-VL), and [VLM2Vec](https://github.com/TIGER-AI-Lab/VLM2Vec) for providing open-source resources that contributed to the development of this project.
 
 
-<!-- 
-## ⭐️ Citation
-If you find this project useful, welcome to cite us.
-```bib
-
-``` -->
+## Citation
+If you find our work useful, please consider citing it.
+```
+@article{lan2025ume,
+  title={UME-R1: Exploring Reasoning-Driven Generative Multimodal Embeddings},
+  author={Lan, Zhibin and Niu, Liqiang and Meng, Fandong and Zhou, Jie and Su, Jinsong},
+  journal={arXiv preprint arXiv:2511.00405},
+  year={2025}
+}
+```
