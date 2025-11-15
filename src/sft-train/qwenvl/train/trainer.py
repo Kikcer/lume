@@ -628,8 +628,6 @@ def forward(
         "pos_loss": pos_output.loss,
         "gen_contrastive_loss": gen_contrastive_loss,
         "disc_contrastive_loss": disc_contrastive_loss,
-        "gen_disc_contrastive_loss": gen_disc_contrastive_loss,
-        "disc_gen_contrastive_loss": disc_gen_contrastive_loss,
     }
 
 def single_forward(
@@ -1042,8 +1040,6 @@ def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=N
             "pos_loss": outputs["pos_loss"].item(),
             "gen_contrastive_loss": outputs["gen_contrastive_loss"].item(),
             "disc_contrastive_loss": outputs["disc_contrastive_loss"].item(),
-            "gen_disc_contrastive_loss": outputs["gen_disc_contrastive_loss"].item(),
-            "disc_gen_contrastive_loss": outputs["disc_gen_contrastive_loss"].item(),
         }
     )
     return (loss, outputs) if return_outputs else loss
