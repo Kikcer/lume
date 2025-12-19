@@ -302,7 +302,7 @@ We also provide several complete examples in the **demo** folder.
 ## 💪🏻 Training
 
 ### 📚 SFT
-1. Please refer to [VLM2Vec](https://github.com/TIGER-AI-Lab/VLM2Vec/blob/main/experiments/public/data/download_data.sh) to download the image and video. For the image and video data of Visdoc and Video, run the Python scripts under **UME-R1/src/data-process** to automatically download them (The generated JSON files can be ignored). In addition, please copy the image **UME-R1/assets/blank.jpg** to the newly created **images** folder. Then, please organize the dataset in the following directory structure before training:
+1. Please refer to [VLM2Vec](https://github.com/TIGER-AI-Lab/VLM2Vec/blob/main/experiments/public/data/download_data.sh) to download the images. For the image and video data of Visdoc and Video, run the Python scripts under **UME-R1/src/data-process** to automatically download them (The generated JSON files can be ignored). In addition, please copy the image **UME-R1/assets/blank.jpg** to the newly created **images** folder. Then, please organize the dataset in the following directory structure before training:
 
 ```bash
 images
