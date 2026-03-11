@@ -598,10 +598,48 @@ def forward(
     disc_qry_reps = get_embedding_reps(qry_output.hidden_states[-1], qry['input_ids'], embedding_token_id=DISC_EMB_ID)
     disc_pos_reps = get_embedding_reps(pos_output.hidden_states[-1], pos['input_ids'], embedding_token_id=DISC_EMB_ID)
 
+    # --- raw norms (before normalize) for debug ---
+    disc_qry_raw_norm = disc_qry_reps.norm(dim=-1)
+    disc_pos_raw_norm = disc_pos_reps.norm(dim=-1)
+    gen_qry_raw_norm = gen_qry_reps.norm(dim=-1)
+    gen_pos_raw_norm = gen_pos_reps.norm(dim=-1)
+
     gen_qry_reps = torch.nn.functional.normalize(gen_qry_reps, p=2, dim=-1)
     gen_pos_reps = torch.nn.functional.normalize(gen_pos_reps, p=2, dim=-1)
     disc_qry_reps = torch.nn.functional.normalize(disc_qry_reps, p=2, dim=-1)
     disc_pos_reps = torch.nn.functional.normalize(disc_pos_reps, p=2, dim=-1)
+
+    # --- DEBUG: cosine diagnostics (first 10 steps, rank 0 only) ---
+    if not hasattr(forward, '_debug_step'):
+        forward._debug_step = 0
+    forward._debug_step += 1
+    if forward._debug_step <= 10 and torch.distributed.get_rank() == 0:
+        with torch.no_grad():
+            d_cos_diag = (disc_qry_reps * disc_pos_reps).sum(dim=-1)
+            d_sim = disc_qry_reps @ disc_pos_reps.t()
+            d_offdiag = (d_sim.sum() - d_sim.diag().sum()) / max(d_sim.numel() - d_sim.shape[0], 1)
+            g_cos_diag = (gen_qry_reps * gen_pos_reps).sum(dim=-1)
+            g_sim = gen_qry_reps @ gen_pos_reps.t()
+            g_offdiag = (g_sim.sum() - g_sim.diag().sum()) / max(g_sim.numel() - g_sim.shape[0], 1)
+            # disc_emb positions in input_ids
+            disc_positions_qry = [(qry['input_ids'][b] == DISC_EMB_ID).nonzero(as_tuple=False).flatten().tolist() for b in range(qry['input_ids'].shape[0])]
+            disc_positions_pos = [(pos['input_ids'][b] == DISC_EMB_ID).nonzero(as_tuple=False).flatten().tolist() for b in range(pos['input_ids'].shape[0])]
+            print(
+                f"[ORIG-DEBUG-DISC] step={forward._debug_step} "
+                f"disc_qry_norm={disc_qry_raw_norm.tolist()} disc_pos_norm={disc_pos_raw_norm.tolist()} "
+                f"disc_cos_diag={d_cos_diag.tolist()} "
+                f"disc_offdiag_mean={d_offdiag.item():.6f} "
+                f"disc_pos_qry={disc_positions_qry} disc_pos_pos={disc_positions_pos} "
+                f"qry_seqlen={qry['input_ids'].shape[1]} pos_seqlen={pos['input_ids'].shape[1]}",
+                flush=True,
+            )
+            print(
+                f"[ORIG-DEBUG-GEN]  step={forward._debug_step} "
+                f"gen_qry_norm={gen_qry_raw_norm.tolist()} gen_pos_norm={gen_pos_raw_norm.tolist()} "
+                f"gen_cos_diag={g_cos_diag.tolist()} "
+                f"gen_offdiag_mean={g_offdiag.item():.6f}",
+                flush=True,
+            )
 
     gen_loss_fct = ClipLoss(local_loss=True, gather_with_grad=True, rank=torch.distributed.get_rank(group=None), world_size=torch.distributed.get_world_size(group=None))
     disc_loss_fct = ClipLoss(local_loss=True, gather_with_grad=True, rank=torch.distributed.get_rank(group=None), world_size=torch.distributed.get_world_size(group=None))

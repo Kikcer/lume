@@ -6,6 +6,12 @@ from typing import List
 @dataclass
 class ModelArguments:
     model_name: str = field(metadata={"help": "huggingface model name or path"})
+    model_base: str = field(
+        default=None,
+        metadata={
+            "help": "Base model path used when model_name/checkpoint_path points to a LoRA adapter."
+        },
+    )
     model_type: str = field(default=None, metadata={"help": "model type, typically includes in config file, but sometimes needs mannually add"})
     processor_name: str = field(default=None, metadata={"help": "processor_name, huggingface model name or path"})
     model_backbone: str = field(default=None, metadata={"help": "HF model type"})

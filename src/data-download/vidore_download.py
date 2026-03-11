@@ -24,7 +24,7 @@ def load_vidore_dataset(split="train"):
         query = f"{prompt} {query}"
         
         # save the image to {count}.jpg
-        image_path = os.path.join("MMEB-train/vidore/images", f"{count}.jpg")
+        image_path = os.path.join("/home/share/yty_data/UME_R1_train/MMEB-train/vidore/images", f"{count}.jpg")
         if not os.path.exists(os.path.dirname(image_path)):
             os.makedirs(os.path.dirname(image_path))
         
@@ -40,7 +40,7 @@ def load_vidore_dataset(split="train"):
         })
 
         count += 1
-    save_path = 'MMEB-train/vidore/vidore_train.json'
+    save_path = '/home/share/yty_data/UME_R1_train/MMEB-train/vidore/vidore_train.json'
     if not os.path.exists(os.path.dirname(save_path)):
         os.makedirs(os.path.dirname(save_path))
 

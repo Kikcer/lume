@@ -1,0 +1,34 @@
+# Large directories
+output/
+MMEB-train/
+wandb/
+log/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.log
+monitor.log
+*.jpg
+*.png
+!assets/**/*.jpg
+!assets/**/*.png

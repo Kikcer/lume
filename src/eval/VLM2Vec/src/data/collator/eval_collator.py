@@ -241,20 +241,44 @@ class MultimodalEvalDataCollator:
                                 )
                         
                         elif vlm_video_token in text:
-                            messages.append(
-                                [
-                                    {
-                                        "role": "user",
-                                        "content": [
-                                            {
-                                                "type": "video", 
-                                                "video": visual_paths,
-                                            },
-                                            {"type": "text", "text": text.replace(vlm_video_token, '').strip() + "\n<disc_emb>\n" + GENERATION_PROMPT},
-                                        ],
-                                    }
-                                ]
+                            has_valid_video = (
+                                isinstance(visual_paths, list)
+                                and len(visual_paths) > 0
+                                and all(v is not None for v in visual_paths)
                             )
+                            if has_valid_video:
+                                messages.append(
+                                    [
+                                        {
+                                            "role": "user",
+                                            "content": [
+                                                {
+                                                    "type": "video",
+                                                    "video": visual_paths,
+                                                },
+                                                {"type": "text", "text": text.replace(vlm_video_token, '').strip() + "\n<disc_emb>\n" + GENERATION_PROMPT},
+                                            ],
+                                        }
+                                    ]
+                                )
+                            else:
+                                # Some video eval items may resolve to an empty frame list.
+                                # Fallback to text-only style input to avoid processor crash.
+                                blank_image = Image.new("RGB", (28, 28), (255, 255, 255))
+                                buffer = io.BytesIO()
+                                blank_image.save(buffer, format='JPEG')
+                                base64_blank_image = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                                messages.append(
+                                    [
+                                        {
+                                            "role": "user",
+                                            "content": [
+                                                {"type": "image", "image": f"data:image;base64,{base64_blank_image}"},
+                                                {"type": "text", "text": text.replace(vlm_video_token, '').strip() + "\n<disc_emb>\n" + GENERATION_PROMPT},
+                                            ],
+                                        }
+                                    ]
+                                )
                         else:
                             blank_image = Image.new("RGB", (28, 28), (255, 255, 255))
                             # base64 encoded blank image

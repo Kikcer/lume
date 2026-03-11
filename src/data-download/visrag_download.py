@@ -59,9 +59,9 @@ def load_visrag_dataset(split="train"):
 
         # save the image to {count}.jpg
         if tgt_image.mode == 'RGBA':
-            image_path = os.path.join("MMEB-train/visrag/images", f"{count}.png")
+            image_path = os.path.join("/home/share/yty_data/UME_R1_train/MMEB-train/visrag/images", f"{count}.png")
         else:
-            image_path = os.path.join("MMEB-train/visrag/images", f"{count}.jpg")
+            image_path = os.path.join("/home/share/yty_data/UME_R1_train/MMEB-train/visrag/images", f"{count}.jpg")
         if not os.path.exists(os.path.dirname(image_path)):
             os.makedirs(os.path.dirname(image_path))
         
@@ -77,7 +77,7 @@ def load_visrag_dataset(split="train"):
         })
         count += 1
     
-    save_path = 'MMEB-train/visrag/visrag_train.json'
+    save_path = '/home/share/yty_data/UME_R1_train/MMEB-train/visrag/visrag_train.json'
     if not os.path.exists(os.path.dirname(save_path)):
         os.makedirs(os.path.dirname(save_path))
 

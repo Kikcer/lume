@@ -1,4 +1,5 @@
 import logging
+import os
 
 import PIL
 from transformers.image_utils import ChannelDimension
@@ -97,17 +98,39 @@ backbone2model = {
 }
 
 
+def _resolve_processor_load_paths(model_args):
+    """
+    For adapter-only checkpoints, processor files (e.g., preprocessor_config.json)
+    may live in base model path, while tokenizer files may live in adapter path.
+    """
+    model_name_or_path = model_args.checkpoint_path if model_args.checkpoint_path else model_args.model_name
+    processor_name_or_path = model_name_or_path
+    tokenizer_name_or_path = model_name_or_path
+    model_base = getattr(model_args, "model_base", None)
+
+    if model_base and os.path.isdir(str(model_name_or_path)):
+        preprocessor_cfg = os.path.join(model_name_or_path, "preprocessor_config.json")
+        base_preprocessor_cfg = os.path.join(model_base, "preprocessor_config.json")
+        if (not os.path.exists(preprocessor_cfg)) and os.path.exists(base_preprocessor_cfg):
+            processor_name_or_path = model_base
+            print_master(
+                f"Processor files are missing in adapter path, fallback to base model: {processor_name_or_path}"
+            )
+
+    return model_name_or_path, processor_name_or_path, tokenizer_name_or_path
+
+
 def load_processor(model_args, data_args=None):
     """
     Load processor based on VLM backbone.
     Note: due to this change, https://github.com/huggingface/transformers/commit/9215cc62d4366072aacafa4e44028c1ca187167b#diff-6505546ec5a9ab74b2ce6511681dd31194eb91e9fa3ce26282e487a5e61f9356L1102
     """
-    model_name_or_path = model_args.checkpoint_path if model_args.checkpoint_path else model_args.model_name
+    model_name_or_path, processor_name_or_path, tokenizer_name_or_path = _resolve_processor_load_paths(model_args)
     print_master(f'Loading processor from: {model_name_or_path}')
     if model_args.model_backbone == PHI3V:
         from src.model.baseline_backbone.phi3_v.processing_phi3_v import Phi3VProcessor
         processor = Phi3VProcessor.from_pretrained(
-            model_name_or_path,
+            processor_name_or_path,
             trust_remote_code=True,
             num_crops=model_args.num_crops
         )
@@ -115,7 +138,7 @@ def load_processor(model_args, data_args=None):
     elif model_args.model_backbone == LLAVA_NEXT:
         from src.model.baseline_backbone.llava_next import LlavaNextProcessor
         processor = LlavaNextProcessor.from_pretrained(
-            model_name_or_path,
+            processor_name_or_path,
             trust_remote_code=True
         )
     elif model_args.model_backbone in [QWEN2_VL, GME, LamRA]:
@@ -126,24 +149,24 @@ def load_processor(model_args, data_args=None):
         if data_args is not None:
             min_pixels, max_pixels = data_args.resize_min_pixels, data_args.resize_max_pixels
         size = {"shortest_edge": min_pixels, "longest_edge": max_pixels}
-        image_processor = Qwen2VLImageProcessor.from_pretrained(model_name_or_path, size=size)
-        tokenizer = Qwen2TokenizerFast.from_pretrained(model_name_or_path)
+        image_processor = Qwen2VLImageProcessor.from_pretrained(processor_name_or_path, size=size)
+        tokenizer = Qwen2TokenizerFast.from_pretrained(tokenizer_name_or_path)
         processor = Qwen2VLProcessor.from_pretrained(
-            model_name_or_path,
+            processor_name_or_path,
             image_processor=image_processor, tokenizer=tokenizer, size=size
         )
     elif model_args.model_backbone == QWEN2_VL_TOKENSELECTION:
         from src.model.vlm_backbone.qwen2_vl_tokenselection.processing_qwen2_vl import Qwen2VLProcessor
         from src.model.vlm_backbone.qwen2_vl_tokenselection.image_processing_qwen2_vl import Qwen2VLImageProcessor
         from src.model.vlm_backbone.qwen2_vl_tokenselection.tokenization_qwen2_fast import Qwen2TokenizerFast
-        image_processor = Qwen2VLImageProcessor.from_pretrained(model_name_or_path)
+        image_processor = Qwen2VLImageProcessor.from_pretrained(processor_name_or_path)
         if data_args is not None:
             image_processor.do_resize = data_args.resize_use_processor
             image_processor.min_pixels = data_args.resize_min_pixels
             image_processor.max_pixels = data_args.resize_max_pixels
-        tokenizer = Qwen2TokenizerFast.from_pretrained(model_name_or_path)
+        tokenizer = Qwen2TokenizerFast.from_pretrained(tokenizer_name_or_path)
         processor = Qwen2VLProcessor.from_pretrained(
-            model_name_or_path,
+            processor_name_or_path,
             image_processor=image_processor, tokenizer=tokenizer,
             uigraph_use=model_args.uigraph_use,
             uigraph_diff=model_args.uigraph_diff,  uigraph_rand=model_args.uigraph_rand,
@@ -157,9 +180,9 @@ def load_processor(model_args, data_args=None):
         if data_args is not None:
             min_pixels, max_pixels = data_args.resize_min_pixels, data_args.resize_max_pixels
         size = {"shortest_edge": min_pixels, "longest_edge": max_pixels, "min_pixels": min_pixels, "max_pixels": max_pixels}
-        image_processor = Qwen2_5_VLImageProcessor.from_pretrained(model_name_or_path, size=size)
-        tokenizer = Qwen2TokenizerFast.from_pretrained(model_name_or_path)
-        processor = Qwen2_5_VLProcessor.from_pretrained(model_name_or_path, image_processor=image_processor, tokenizer=tokenizer)
+        image_processor = Qwen2_5_VLImageProcessor.from_pretrained(processor_name_or_path, size=size)
+        tokenizer = Qwen2TokenizerFast.from_pretrained(tokenizer_name_or_path)
+        processor = Qwen2_5_VLProcessor.from_pretrained(processor_name_or_path, image_processor=image_processor, tokenizer=tokenizer)
     elif model_args.model_backbone == QWEN2_5_VL_TOKENSELECTION:
         # TODO: qwen2.5 token selection not working yet
         from src.model.vlm_backbone.qwen2_5_vl_tokenselection.processing_qwen2_5_vl import Qwen2_5_VLProcessor
@@ -169,10 +192,10 @@ def load_processor(model_args, data_args=None):
         if data_args is not None:
             min_pixels, max_pixels = data_args.resize_min_pixels, data_args.resize_max_pixels
         size = {"shortest_edge": min_pixels, "longest_edge": max_pixels, "min_pixels": min_pixels, "max_pixels": max_pixels}
-        image_processor = Qwen2_5_VLImageProcessor.from_pretrained(model_name_or_path, size=size)
-        tokenizer = Qwen2TokenizerFast.from_pretrained(model_name_or_path)
+        image_processor = Qwen2_5_VLImageProcessor.from_pretrained(processor_name_or_path, size=size)
+        tokenizer = Qwen2TokenizerFast.from_pretrained(tokenizer_name_or_path)
         processor = Qwen2_5_VLProcessor.from_pretrained(
-            model_name_or_path,
+            processor_name_or_path,
             image_processor=image_processor, tokenizer=tokenizer,
             uigraph_use=model_args.uigraph_use,
             uigraph_diff=model_args.uigraph_diff,  uigraph_rand=model_args.uigraph_rand,
@@ -182,11 +205,11 @@ def load_processor(model_args, data_args=None):
         return None
     elif model_args.model_backbone == COLPALI:
         from transformers import AutoProcessor
-        processor = ColPaliProcessor.from_pretrained(model_args.model_name)
+        processor = ColPaliProcessor.from_pretrained(processor_name_or_path)
     else:
         from transformers import AutoProcessor
         processor = AutoProcessor.from_pretrained(
-            model_args.processor_name if model_args.processor_name else model_args.model_name,
+            model_args.processor_name if model_args.processor_name else processor_name_or_path,
             trust_remote_code=True,
         )
     return processor

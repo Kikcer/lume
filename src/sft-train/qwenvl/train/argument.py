@@ -14,6 +14,17 @@ class ModelArguments:
     lora_r: int = field(default=8)
     lora_alpha: int = field(default=16)
     lora_dropout: float = field(default=0.1)
+    coconut_force_reinit_all_tokens: bool = field(
+        default=False,
+        metadata={
+            "help": "Force re-initialize ALL special token embeddings (including pretrained <gen_emb>/<disc_emb>). "
+                    "Use for ablation experiments only."
+        },
+    )
+    lora_use_dora: bool = field(
+        default=False,
+        metadata={"help": "Enable DoRA variant for LoRA (higher memory usage)."},
+    )
     lora_target_modules: str = field(
         default="qkv_proj,o_proj,gate_up_proj,down_proj,k_proj,q_proj,out_proj,v_proj",
         metadata={"help": "lora target modules"}
@@ -32,6 +43,128 @@ class DataArguments:
     video_max_frame_pixels: int = field(default=32 * 28 * 28)
     video_min_frame_pixels: int = field(default=4 * 28 * 28)
     data_group: bool = field(default=True)
+    coconut_sampling_strategy: str = field(
+        default="legacy",
+        metadata={
+            "help": "Sampling strategy for COCONUT training. `legacy` keeps the original sampler; "
+                    "`subset_balanced` makes each global batch contain one sub-dataset and spreads "
+                    "every sub-dataset across the full curriculum timeline."
+        },
+    )
+    coconut_annotation_path: str = field(
+        default="/home/share/yty_data/UME_R1_train/UME-sft-train.jsonl",
+        metadata={"help": "Path to UME SFT json/jsonl annotations. Prefer jsonl for lower RAM."},
+    )
+    coconut_media_root: str = field(
+        default="/home/share/yty_data/vlm2vec_train",
+        metadata={"help": "Optional media root used to resolve relative image/video paths."},
+    )
+    coconut_subset_filter: str = field(
+        default="CIRR",
+        metadata={"help": "Comma-separated dataset_name filters. Default keeps CIRR subset."},
+    )
+    coconut_use_qry: bool = field(
+        default=True,
+        metadata={"help": "Whether to use qry side samples."},
+    )
+    coconut_use_pos: bool = field(
+        default=True,
+        metadata={"help": "Whether to use pos side samples."},
+    )
+    coconut_curriculum_stages: str = field(
+        default="0,0.25,0.5,0.75,1.0",
+        metadata={"help": "Comma-separated replacement ratios for curriculum stages."},
+    )
+    coconut_final_stage_portion: float = field(
+        default=0.5,
+        metadata={
+            "help": "Portion of total training reserved for the final curriculum stage. "
+                    "The remaining portion is evenly split across earlier stages."
+        },
+    )
+    coconut_latent_answer_in_final_half: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, split the final curriculum stage into two halves: keep answer text in the first half, "
+                    "then drop answer text in the second half so latent steps are followed by <gen_emb>."
+        },
+    )
+    coconut_final_stage_answer_portion: float = field(
+        default=0.5,
+        metadata={
+            "help": "Portion inside the final curriculum stage where answer text is removed when "
+                    "coconut_latent_answer_in_final_half=True. 0.5 means the second half of the final stage."
+        },
+    )
+    coconut_think_segments: int = field(
+        default=4,
+        metadata={"help": "Number of coarse thought segments (m)."},
+    )
+    coconut_ct_tokens_per_segment: int = field(
+        default=1,
+        metadata={"help": "Latent length multiplier per replaced segment (c)."},
+    )
+    coconut_include_gen_emb_loss: bool = field(
+        default=True,
+        metadata={"help": "Whether to include <gen_emb> token in CE loss."},
+    )
+    coconut_gen_contrastive_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight for gen embedding contrastive loss."},
+    )
+    coconut_disc_contrastive_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight for disc embedding contrastive loss."},
+    )
+    coconut_contrastive_logit_scale: float = field(
+        default=50.0,
+        metadata={"help": "Logit scale used by contrastive loss."},
+    )
+    coconut_contrastive_cross_device: bool = field(
+        default=True,
+        metadata={"help": "Whether to gather contrastive pairs across GPUs."},
+    )
+    coconut_contrastive_local_loss: bool = field(
+        default=True,
+        metadata={"help": "If True, use local anchors against global negatives."},
+    )
+    coconut_debug_disc_oracle_pos_from_qry: bool = field(
+        default=False,
+        metadata={
+            "help": "Debug only: replace disc pos reps with detached disc qry reps to verify contrastive label alignment."
+        },
+    )
+    coconut_debug_contrastive_stats: bool = field(
+        default=False,
+        metadata={
+            "help": "Debug only: log contrastive diag/offdiag/top1 stats (for gen/disc) during training."
+        },
+    )
+    coconut_debug_disc_fullseq_alignment: bool = field(
+        default=False,
+        metadata={
+            "help": "Debug only: compare COCONUT prefix disc reps against full-sequence disc reps and log cosine stats."
+        },
+    )
+    coconut_enable_oom_precheck: bool = field(
+        default=True,
+        metadata={
+            "help": "Run per-stage OOM precheck before actual training starts."
+        },
+    )
+    coconut_oom_precheck_batches: int = field(
+        default=2,
+        metadata={
+            "help": "How many mini-batches to probe for each prechecked curriculum stage."
+        },
+    )
+    coconut_oom_precheck_subsets: str = field(
+        default="",
+        metadata={
+            "help": "Comma-separated dataset names to sample from during OOM precheck "
+                    "(e.g. 'K700,Video-MME,YouCook2'). Empty means use the training dataloader as-is."
+        },
+    )
 
 
 @dataclass

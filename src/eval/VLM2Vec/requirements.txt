@@ -15,6 +15,7 @@ py-cpuinfo
 hjson
 scikit-learn
 scikit-image
+pytrec-eval-terrier
 qwen_vl_utils
 ray
 timm

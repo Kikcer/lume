@@ -148,20 +148,20 @@ def load_llavahound_caption_dataset(dataset, frame_basedir, save_file, data_mode
 
 if __name__ == "__main__":
     num_frames = 8  # Number of frames to sample from each video
-    dataset_path = "MMEB-train/llavahound/train_video_and_instruction/video_instruction/train/sft/video_caption_300k.jsonl"
-    frame_basedir = "MMEB-train/llavahound/train_video_and_instruction/train_300k"
+    dataset_path = "/home/share/yty_data/UME_R1_train/MMEB-train/llavahound/train_video_and_instruction/video_instruction/train/sft/video_caption_300k.jsonl"
+    frame_basedir = "/home/share/yty_data/UME_R1_train/MMEB-train/llavahound/train_video_and_instruction/train_300k"
     dataset = datasets.load_dataset("json", split="train", data_files=dataset_path, streaming=False)
 
     # caption
-    save_file = "MMEB-train/llavahound/llavahound_caption_retrieval_train.json"
+    save_file = "/home/share/yty_data/UME_R1_train/MMEB-train/llavahound/llavahound_caption_retrieval_train.json"
     load_llavahound_caption_dataset(dataset, frame_basedir, data_mode="caption_retrieval", num_frames=num_frames, save_file=save_file)
 
-    save_file = "MMEB-train/llavahound/llavahound_video_retrieval_train.json"
+    save_file = "/home/share/yty_data/UME_R1_train/MMEB-train/llavahound/llavahound_video_retrieval_train.json"
     load_llavahound_caption_dataset(dataset, frame_basedir, data_mode="video_retrieval", num_frames=num_frames, save_file=save_file)
 
     # qa
-    dataset_path = "MMEB-train/llavahound/train_video_and_instruction/video_instruction/train/sft/video_240k_caption_15k.jsonl"
-    frame_basedir = "MMEB-train/llavahound/train_video_and_instruction/train_300k"
+    dataset_path = "/home/share/yty_data/UME_R1_train/MMEB-train/llavahound/train_video_and_instruction/video_instruction/train/sft/video_240k_caption_15k.jsonl"
+    frame_basedir = "/home/share/yty_data/UME_R1_train/MMEB-train/llavahound/train_video_and_instruction/train_300k"
     dataset = datasets.load_dataset("json", split="train", data_files=dataset_path, streaming=False)    
-    save_file = "MMEB-train/llavahound/llavahound_qa_retrieval_train.json"
+    save_file = "/home/share/yty_data/UME_R1_train/MMEB-train/llavahound/llavahound_qa_retrieval_train.json"
     load_llavahound_caption_dataset(dataset, frame_basedir, data_mode="qa_retrieval", num_frames=num_frames, save_file=save_file)
