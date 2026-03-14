@@ -10,7 +10,7 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 WORK_DIR="${WORK_DIR:-/home/guohaiyun/yangtianyu/UME-R1}"
 
-MODEL_PATH="${MODEL_PATH:-/output/UME-R1-2B-Coconut-Fulldata-8node-2026-03-08-21-00-10/checkpoint-2862}"
+MODEL_PATH="${MODEL_PATH:-/home/share/yty_model/UME-R1/2B/UME-R1/2B}"
 ANNOTATION_PATH="${ANNOTATION_PATH:-/home/share/yty_data/UME_R1_train/UME-sft-train.jsonl}"
 MEDIA_ROOT="${MEDIA_ROOT:-/home/share/yty_data/vlm2vec_train}"
 SUBSET_FILTER="${SUBSET_FILTER:-InfographicsVQA}"
@@ -18,8 +18,8 @@ MAX_PIXELS="${MAX_PIXELS:-2359296}"                  # 28*28*576
 MIN_PIXELS="${MIN_PIXELS:-768}"     
 PER_DEVICE_BS="${PER_DEVICE_BS:-16}"
 GRAD_ACC="${GRAD_ACC:-1}"
-LR="${LR:-2e-6}"
-EPOCHS="${EPOCHS:-3}"
+LR="${LR:-2e-5}"
+EPOCHS="${EPOCHS:-5}"
 MAX_LEN="${MAX_LEN:-12288}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
@@ -28,6 +28,17 @@ WEIGHT_DECAY="${WEIGHT_DECAY:-0}"
 LORA_R="${LORA_R:-16}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
 LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj}"
+LATENT_MOE_ENABLE="${LATENT_MOE_ENABLE:-True}"
+LATENT_MOE_NUM_EXPERTS="${LATENT_MOE_NUM_EXPERTS:-4}"
+LATENT_MOE_TOP_K="${LATENT_MOE_TOP_K:-2}"
+LATENT_MOE_USE_SHARED_EXPERT="${LATENT_MOE_USE_SHARED_EXPERT:-True}"
+LATENT_MOE_BALANCE_LOSS_WEIGHT="${LATENT_MOE_BALANCE_LOSS_WEIGHT:-0.1}"
+LATENT_MOE_STEP_EMBED_MAX_STEPS="${LATENT_MOE_STEP_EMBED_MAX_STEPS:-32}"
+LATENT_MOE_CONTEXT_TYPE="${LATENT_MOE_CONTEXT_TYPE:-none}"
+
+FINAL_STAGE_PORTION="${FINAL_STAGE_PORTION:-0.5}"
+LATENT_ANSWER_IN_FINAL_HALF="${LATENT_ANSWER_IN_FINAL_HALF:-True}"
+FINAL_STAGE_ANSWER_PORTION="${FINAL_STAGE_ANSWER_PORTION:-0.5}"
 
 THINK_SEGMENTS="${THINK_SEGMENTS:-4}"
 CT_PER_SEG="${CT_PER_SEG:-1}"
@@ -58,6 +69,7 @@ export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-OFF}"
 
 GLOBAL_BATCH=$(( PER_DEVICE_BS * GRAD_ACC * NPROC_PER_NODE ))
 echo "[COCONUT-GC-LAUNCH] nproc=${NPROC_PER_NODE}, per_device_bs=${PER_DEVICE_BS}, grad_acc=${GRAD_ACC}, effective_global_batch=${GLOBAL_BATCH}"
+echo "[COCONUT-GC-LAUNCH] latent_moe enable=${LATENT_MOE_ENABLE}, experts=${LATENT_MOE_NUM_EXPERTS}, top_k=${LATENT_MOE_TOP_K}, ctx=${LATENT_MOE_CONTEXT_TYPE}, balance_w=${LATENT_MOE_BALANCE_LOSS_WEIGHT}"
 echo "[COCONUT-GC-LAUNCH] output_dir=${OUTPUT_DIR}"
 echo "[COCONUT-GC-LAUNCH] work_dir=${WORK_DIR}"
 echo "[COCONUT-GC-LAUNCH] pwd(before cd)=$(pwd)"
@@ -85,6 +97,13 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" WANDB_MODE="${WANDB_MODE}" \
   --model_max_length "${MAX_LEN}" \
   --gradient_checkpointing True \
   --use_lora False \
+  --latent_moe_enable "${LATENT_MOE_ENABLE}" \
+  --latent_moe_num_experts "${LATENT_MOE_NUM_EXPERTS}" \
+  --latent_moe_top_k "${LATENT_MOE_TOP_K}" \
+  --latent_moe_use_shared_expert "${LATENT_MOE_USE_SHARED_EXPERT}" \
+  --latent_moe_balance_loss_weight "${LATENT_MOE_BALANCE_LOSS_WEIGHT}" \
+  --latent_moe_step_embed_max_steps "${LATENT_MOE_STEP_EMBED_MAX_STEPS}" \
+  --latent_moe_context_type "${LATENT_MOE_CONTEXT_TYPE}" \
   --lora_r "${LORA_R}" \
   --lora_alpha "${LORA_ALPHA}" \
   --lora_use_dora False \
@@ -99,8 +118,11 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" WANDB_MODE="${WANDB_MODE}" \
   --coconut_media_root "${MEDIA_ROOT}" \
   --coconut_use_qry True \
   --coconut_use_pos True \
-  --coconut_curriculum_stages 1.0 \
+  --coconut_curriculum_stages 0.25,0.5,1.0 \
   --coconut_think_segments "${THINK_SEGMENTS}" \
+  --coconut_final_stage_portion "${FINAL_STAGE_PORTION}" \
+  --coconut_latent_answer_in_final_half "${LATENT_ANSWER_IN_FINAL_HALF}" \
+  --coconut_final_stage_answer_portion "${FINAL_STAGE_ANSWER_PORTION}" \
   --coconut_ct_tokens_per_segment "${CT_PER_SEG}" \
   --coconut_include_gen_emb_loss True \
   --coconut_gen_contrastive_weight "${GEN_CONTRASTIVE_W}" \
@@ -108,7 +130,6 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" WANDB_MODE="${WANDB_MODE}" \
   --coconut_contrastive_logit_scale "${CONTRASTIVE_LOGIT_SCALE}" \
   --coconut_contrastive_cross_device True \
   --coconut_contrastive_local_loss True \
-  --coconut_latent_answer_in_final_half False \
   --coconut_debug_disc_oracle_pos_from_qry "${DEBUG_DISC_ORACLE_POS_FROM_QRY}" \
   --coconut_oom_precheck_batches "${COCONUT_OOM_PRECHECK_BATCHES}" \
   --coconut_enable_oom_precheck "${COCONUT_ENABLE_OOM_PRECHECK}"

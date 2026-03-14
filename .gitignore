@@ -32,3 +32,5 @@ monitor.log
 *.png
 !assets/**/*.jpg
 !assets/**/*.png
+*.tar.gz
+*.gz

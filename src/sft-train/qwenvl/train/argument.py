@@ -29,6 +29,36 @@ class ModelArguments:
         default="qkv_proj,o_proj,gate_up_proj,down_proj,k_proj,q_proj,out_proj,v_proj",
         metadata={"help": "lora target modules"}
     )
+    latent_moe_enable: bool = field(
+        default=False,
+        metadata={"help": "Enable latent MoE transition in latent loop."},
+    )
+    latent_moe_num_experts: int = field(
+        default=4,
+        metadata={"help": "Number of routed experts in latent MoE."},
+    )
+    latent_moe_top_k: int = field(
+        default=2,
+        metadata={"help": "Top-k experts selected by latent MoE router."},
+    )
+    latent_moe_use_shared_expert: bool = field(
+        default=True,
+        metadata={"help": "Whether to enable shared expert branch in latent MoE."},
+    )
+    latent_moe_balance_loss_weight: float = field(
+        default=0.0,
+        metadata={"help": "Weight of latent MoE balance loss; 0.0 keeps baseline objective."},
+    )
+    latent_moe_step_embed_max_steps: int = field(
+        default=32,
+        metadata={"help": "Max number of latent steps covered by step embedding table."},
+    )
+    latent_moe_context_type: str = field(
+        default="prefix_last",
+        metadata={
+            "help": "Router context source for latent MoE. One of: none, prefix_last, disc."
+        },
+    )
 
 
 @dataclass

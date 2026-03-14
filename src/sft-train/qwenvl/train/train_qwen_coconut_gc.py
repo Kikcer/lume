@@ -310,6 +310,8 @@ def train(attn_implementation: str = "flash_attention_2"):
         coconut_base._unwrap_model(model).get_input_embeddings().requires_grad_(True)
         coconut_base._get_lm_head(model).requires_grad_(True)
 
+    coconut_base.initialize_latent_moe(model, model_args)
+
     if (not dist.is_initialized()) or dist.get_rank() == 0:
         coconut_base.safe_print_trainable_parameters(model, use_lora=model_args.use_lora)
 
@@ -357,6 +359,13 @@ def train(attn_implementation: str = "flash_attention_2"):
         f"use_dora={model_args.lora_use_dora}"
     )
     coconut_base.rank0_print(
+        f"[COCONUT-GC][TRAIN] latent_moe: enabled={model_args.latent_moe_enable}, "
+        f"num_experts={model_args.latent_moe_num_experts}, top_k={model_args.latent_moe_top_k}, "
+        f"use_shared_expert={model_args.latent_moe_use_shared_expert}, "
+        f"context_type={model_args.latent_moe_context_type}, "
+        f"balance_w={model_args.latent_moe_balance_loss_weight}"
+    )
+    coconut_base.rank0_print(
         f"[COCONUT-GC][TRAIN] manual_gradient_checkpointing={manual_gc_enabled}, "
         f"use_reentrant={manual_gc_use_reentrant}"
     )
@@ -376,6 +385,9 @@ def train(attn_implementation: str = "flash_attention_2"):
         contrastive_cross_device=data_args.coconut_contrastive_cross_device,
         contrastive_local_loss=data_args.coconut_contrastive_local_loss,
         debug_disc_oracle_pos_from_qry=data_args.coconut_debug_disc_oracle_pos_from_qry,
+        latent_moe_enable=model_args.latent_moe_enable,
+        latent_moe_balance_loss_weight=model_args.latent_moe_balance_loss_weight,
+        latent_moe_context_type=model_args.latent_moe_context_type,
         enable_manual_gradient_checkpointing=manual_gc_enabled,
         manual_gc_use_reentrant=manual_gc_use_reentrant,
         callbacks=[stage_callback],

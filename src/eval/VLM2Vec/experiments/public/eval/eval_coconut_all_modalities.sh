@@ -19,11 +19,19 @@ set -euo pipefail
 # DATASET_NAMES="Wiki-SS-NQ,VisualNews_t2i,VisualNews_i2t,FashionIQ,Visual7W-Pointing" \
 # DATASET_NAMES="NIGHTS,WebQA,OVEN,EDIS,MSCOCO,RefCOCO,RefCOCO-Matching" \
 # bash src/eval/VLM2Vec/experiments/public/eval/eval_coconut_all_modalities.sh\
+
+
+# 无ans：
+# CHECKPOINT=/home/guohaiyun/yangtianyu/UME-R1/output/UME-R1-2B-Coconut-Fulldata-NoAns-4node-2026-03-10-10-03-52/checkpoint-1431 \
+# USE_COCONUT_LATENT_REASONING=True \
+# COCONUT_LATENT_STEPS=4 \
+# COCONUT_FORCED_SUFFIX_TEXT="<eot></think><gen_emb>" \
+# bash src/eval/VLM2Vec/experiments/public/eval/eval_coconut_all_modalities.sh
 # ---------- Paths ----------
 prefix="${prefix:-/home/guohaiyun/yangtianyu}"
 UME_ROOT="${UME_ROOT:-$prefix/UME-R1}"
 
-CHECKPOINT="${CHECKPOINT:-$UME_ROOT/output/UME-R1-2B-Coconut-Fulldata-8node-2026-03-08-21-00-10/checkpoint-2862}"
+CHECKPOINT="${CHECKPOINT:-$UME_ROOT/output/UME-R1-2B-Coconut-GC-Info-Continue-2026-03-13-22-46-55/checkpoint-830}"
 # MODEL_BASE: set to empty string to skip (for standalone models), or provide a base model path
 if [[ -z "${MODEL_BASE+x}" ]]; then
     # MODEL_BASE not set, use default
@@ -61,7 +69,7 @@ MAX_LEN="${MAX_LEN:-11288}"
 FORCE_REEVAL="${FORCE_REEVAL:-False}"
 
 # Filter specific datasets (comma-separated). Empty = all datasets in yaml.
-DATASET_NAMES="${DATASET_NAMES:-}"
+DATASET_NAMES="${DATASET_NAMES:-InfographicsVQA}"
 
 # Modalities and their yaml configs
 # Override via env: MODALITIES="image" or MODALITIES="image,video"

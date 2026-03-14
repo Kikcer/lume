@@ -3,6 +3,7 @@ import logging
 import json
 import random
 import time
+import re
 
 import numpy as np
 import os
@@ -59,6 +60,7 @@ from src.data.collator.eval_collator import MultimodalEvalDataCollator
 from src.data.eval_dataset.base_eval_dataset import AutoEvalPairDataset, generate_cand_dataset
 from src.eval_utils.metrics import RankingMetrics
 from src.model.model import MMEBModel
+from src.model.latent_moe import LatentMoETransition
 from src.model.processor import get_backbone_name, load_processor, COLPALI, MODEL2BACKBONE
 from src.utils import batch_to_device, print_rank, print_master
 import multiprocessing
@@ -125,7 +127,133 @@ def _resolve_model_paths(model_args: ModelArguments) -> Tuple[str, str]:
     return base_model_path, model_name_or_path
 
 
-def _load_qwen_generation_model(model_args: ModelArguments, processor: AutoProcessor):
+def _normalize_latent_moe_state_key(raw_key: str) -> Optional[str]:
+    marker = "latent_moe_transition."
+    idx = raw_key.find(marker)
+    if idx < 0:
+        return None
+    return raw_key[idx + len(marker) :]
+
+
+def _iter_model_weight_files(model_path: str) -> List[str]:
+    if not os.path.isdir(model_path):
+        return []
+    pattern = re.compile(
+        r"^(model(?:-\d{5}-of-\d{5})?|pytorch_model(?:-\d{5}-of-\d{5})?)\.(safetensors|bin)$"
+    )
+    files = []
+    for name in sorted(os.listdir(model_path)):
+        if pattern.match(name):
+            files.append(os.path.join(model_path, name))
+    return files
+
+
+def _extract_latent_moe_state_from_file(weight_path: str) -> Dict[str, torch.Tensor]:
+    extracted: Dict[str, torch.Tensor] = {}
+    if weight_path.endswith(".safetensors"):
+        try:
+            from safetensors import safe_open
+        except Exception:
+            safe_open = None
+
+        if safe_open is None:
+            return extracted
+
+        with safe_open(weight_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                normalized = _normalize_latent_moe_state_key(key)
+                if normalized is not None:
+                    extracted[normalized] = f.get_tensor(key)
+        return extracted
+
+    state = torch.load(weight_path, map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
+        state = state["state_dict"]
+    if not isinstance(state, dict):
+        return extracted
+    for key, value in state.items():
+        normalized = _normalize_latent_moe_state_key(str(key))
+        if normalized is not None and torch.is_tensor(value):
+            extracted[normalized] = value
+    return extracted
+
+
+def _load_latent_moe_state_from_checkpoint(model, model_path: str) -> bool:
+    latent_moe = _get_latent_moe_module(model)
+    if latent_moe is None:
+        return False
+
+    moe_state: Dict[str, torch.Tensor] = {}
+    for weight_file in _iter_model_weight_files(model_path):
+        moe_state.update(_extract_latent_moe_state_from_file(weight_file))
+
+    if not moe_state:
+        return False
+
+    missing, unexpected = latent_moe.load_state_dict(moe_state, strict=False)
+    print_master(
+        f"[EVAL][LATENT-MOE] loaded from {model_path}; "
+        f"keys={len(moe_state)}, missing={len(missing)}, unexpected={len(unexpected)}"
+    )
+    return True
+
+
+def _attach_eval_latent_moe(
+    model,
+    eval_args: Optional["EvalArguments"],
+    tokenizer=None,
+    checkpoint_path: Optional[str] = None,
+) -> None:
+    if eval_args is None:
+        return
+    if not bool(getattr(eval_args, "use_coconut_latent_moe", False)):
+        return
+
+    raw_model = _unwrap_model(model)
+    hidden_size = int(raw_model.get_input_embeddings().weight.shape[1])
+    latent_moe = LatentMoETransition(
+        hidden_size=hidden_size,
+        num_experts=max(int(getattr(eval_args, "coconut_latent_moe_num_experts", 4)), 1),
+        top_k=max(int(getattr(eval_args, "coconut_latent_moe_top_k", 2)), 1),
+        use_shared_expert=bool(getattr(eval_args, "coconut_latent_moe_use_shared_expert", True)),
+        step_embed_max_steps=max(int(getattr(eval_args, "coconut_latent_moe_step_embed_max_steps", 32)), 1),
+    )
+    emb_weight = raw_model.get_input_embeddings().weight
+    latent_moe = latent_moe.to(dtype=emb_weight.dtype)
+    raw_model.latent_moe_transition = latent_moe
+
+    loaded = False
+    if checkpoint_path:
+        loaded = _load_latent_moe_state_from_checkpoint(model, checkpoint_path)
+    if not loaded:
+        raise ValueError(
+            "[EVAL][LATENT-MOE] enabled but no latent_moe_transition weights were found in checkpoint. "
+            "Please point --model_name/--checkpoint_path to a MoE checkpoint."
+        )
+
+    context_type = str(getattr(eval_args, "coconut_latent_moe_context_type", "prefix_last")).strip().lower()
+    if context_type not in {"none", "prefix_last", "disc"}:
+        raise ValueError("coconut_latent_moe_context_type must be one of: none, prefix_last, disc")
+
+    disc_emb_id = -1
+    if tokenizer is not None:
+        disc_emb_id = int(tokenizer.convert_tokens_to_ids("<disc_emb>"))
+    print_master(
+        "[EVAL][LATENT-MOE] enabled: "
+        f"num_experts={getattr(eval_args, 'coconut_latent_moe_num_experts', 4)}, "
+        f"top_k={getattr(eval_args, 'coconut_latent_moe_top_k', 2)}, "
+        f"use_shared_expert={getattr(eval_args, 'coconut_latent_moe_use_shared_expert', True)}, "
+        f"step_embed_max_steps={getattr(eval_args, 'coconut_latent_moe_step_embed_max_steps', 32)}, "
+        f"context_type={context_type}, disc_emb_id={disc_emb_id}"
+    )
+
+
+def _load_qwen_generation_model(
+    model_args: ModelArguments,
+    processor: AutoProcessor,
+    eval_args: Optional["EvalArguments"] = None,
+):
+    model_name_or_path = model_args.checkpoint_path if model_args.checkpoint_path else model_args.model_name
     base_model_path, adapter_path = _resolve_model_paths(model_args)
     is_qwen25 = _is_qwen25_model(model_args, base_model_path)
     model_cls = Qwen2_5_VLForConditionalGeneration if is_qwen25 else Qwen2VLForConditionalGeneration
@@ -157,6 +285,14 @@ def _load_qwen_generation_model(model_args: ModelArguments, processor: AutoProce
         )
         # Merge for faster/easier multi-GPU eval with plain HF model forward/generate.
         model = model.merge_and_unload()
+
+    tokenizer = processor.tokenizer if (processor is not None and hasattr(processor, "tokenizer")) else None
+    _attach_eval_latent_moe(
+        model=model,
+        eval_args=eval_args,
+        tokenizer=tokenizer,
+        checkpoint_path=model_name_or_path,
+    )
 
     return model
 
@@ -203,6 +339,20 @@ def _resolve_task_data_path(base_dir: str, rel_path: str, key_name: str) -> str:
 
 def _unwrap_model(model):
     return model.module if hasattr(model, "module") else model
+
+
+def _get_latent_moe_module(model):
+    raw_model = _unwrap_model(model)
+    return getattr(raw_model, "latent_moe_transition", None)
+
+
+def _extract_last_token_rep(
+    hidden_states: torch.Tensor, input_ids: torch.Tensor, token_id: int
+) -> Optional[torch.Tensor]:
+    positions = torch.nonzero(input_ids == int(token_id), as_tuple=False).flatten()
+    if positions.numel() == 0:
+        return None
+    return hidden_states[int(positions[-1].item())]
 
 
 def _safe_dist_barrier(timeout_minutes: int = 30) -> None:
@@ -303,6 +453,9 @@ def _latent_reasoning_generate_rep(
     prefix_token_ids: List[int],
     forced_suffix_token_ids: List[int],
     gen_emb_token_id: int,
+    use_latent_moe: bool = False,
+    latent_moe_context_type: str = "prefix_last",
+    disc_emb_token_id: int = -1,
     local_rank: int = 0,
     debug_log_tokens: bool = False,
 ) -> Tuple[torch.Tensor, bool]:
@@ -367,16 +520,48 @@ def _latent_reasoning_generate_rep(
     last_hidden = prefix_hidden[:, -1, :]
     if last_hidden.is_floating_point() and last_hidden.dtype != compute_dtype:
         last_hidden = last_hidden.to(dtype=compute_dtype)
+    prefix_last_hidden = last_hidden
 
     if hasattr(past_key_values, "get_seq_length"):
         processed_len = int(past_key_values.get_seq_length())
     else:
         processed_len = int(past_key_values[0][0].shape[2])
 
+    latent_moe_context_type = str(latent_moe_context_type or "prefix_last").strip().lower()
+    if latent_moe_context_type not in {"none", "prefix_last", "disc"}:
+        raise ValueError("latent_moe_context_type must be one of: none, prefix_last, disc")
+    latent_moe_module = _get_latent_moe_module(model) if use_latent_moe else None
+    if use_latent_moe and latent_moe_module is None:
+        raise RuntimeError("use_latent_moe=True but model has no latent_moe_transition module.")
+    disc_rep = None
+    if use_latent_moe and latent_moe_context_type == "disc" and int(disc_emb_token_id) >= 0:
+        disc_rep = _extract_last_token_rep(
+            prefix_hidden[0], prefix_input_ids[0], int(disc_emb_token_id)
+        )
+
     # 2) Latent loop: inputs_embeds = previous hidden, with KV-cache reuse.
     latent_steps = int(max(latent_steps, 0))
-    for _ in range(latent_steps):
-        step_inputs_embeds = last_hidden.unsqueeze(1)
+    for step_idx in range(latent_steps):
+        step_hidden = last_hidden
+        if latent_moe_module is not None:
+            if latent_moe_context_type == "none":
+                router_context = None
+            elif latent_moe_context_type == "disc":
+                if disc_rep is not None:
+                    router_context = disc_rep.unsqueeze(0) if disc_rep.ndim == 1 else disc_rep
+                else:
+                    router_context = prefix_last_hidden
+            else:
+                router_context = prefix_last_hidden
+            step_hidden, _ = latent_moe_module(
+                step_hidden,
+                step_id=step_idx,
+                context=router_context,
+            )
+            if step_hidden.is_floating_point() and step_hidden.dtype != compute_dtype:
+                step_hidden = step_hidden.to(dtype=compute_dtype)
+
+        step_inputs_embeds = step_hidden.unsqueeze(1)
         if step_inputs_embeds.is_floating_point() and step_inputs_embeds.dtype != compute_dtype:
             step_inputs_embeds = step_inputs_embeds.to(dtype=compute_dtype)
         step_cache_position = torch.tensor([processed_len], dtype=torch.long, device=device)
@@ -567,6 +752,9 @@ def encode_embeddings(
     prefix_token_ids: List[int] = []
     forced_suffix_token_ids: List[int] = []
     gen_emb_token_id = -1
+    use_latent_moe = False
+    latent_moe_context_type = "prefix_last"
+    disc_emb_token_id = -1
     if use_coconut_latent:
         if tokenizer is None:
             raise ValueError("Latent reasoning eval requires processor.tokenizer.")
@@ -582,6 +770,11 @@ def encode_embeddings(
         gen_emb_token_id = int(tokenizer.convert_tokens_to_ids("<gen_emb>"))
         if gen_emb_token_id < 0:
             raise ValueError("Tokenizer does not contain <gen_emb> token.")
+        use_latent_moe = bool(getattr(eval_args, "use_coconut_latent_moe", False))
+        latent_moe_context_type = str(
+            getattr(eval_args, "coconut_latent_moe_context_type", "prefix_last")
+        ).strip().lower()
+        disc_emb_token_id = int(tokenizer.convert_tokens_to_ids("<disc_emb>"))
         debug_log_tokens = getattr(eval_args, "debug_log_tokens", False)
         if local_rank == 0:
             print_master(
@@ -589,7 +782,8 @@ def encode_embeddings(
                 f"latent_steps={latent_steps}, "
                 f"prefix='{getattr(eval_args, 'coconut_prefix_text', '<think><bot>')}', "
                 f"forced_suffix='{getattr(eval_args, 'coconut_forced_suffix_text', '<eot></think><answer>')}', "
-                f"debug_log_tokens={debug_log_tokens}"
+                f"debug_log_tokens={debug_log_tokens}, "
+                f"use_latent_moe={use_latent_moe}, latent_moe_context_type={latent_moe_context_type}"
             )
 
     model.eval()
@@ -618,6 +812,9 @@ def encode_embeddings(
                             prefix_token_ids=prefix_token_ids,
                             forced_suffix_token_ids=forced_suffix_token_ids,
                             gen_emb_token_id=gen_emb_token_id,
+                            use_latent_moe=use_latent_moe,
+                            latent_moe_context_type=latent_moe_context_type,
+                            disc_emb_token_id=disc_emb_token_id,
                             local_rank=local_rank,
                             debug_log_tokens=debug_log_tokens,
                         )
@@ -791,6 +988,34 @@ class EvalArguments:
             "help": "Enable detailed token generation logging (may slow down evaluation)."
         },
     )
+    use_coconut_latent_moe: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable latent MoE transition during COCONUT latent reasoning inference."
+        },
+    )
+    coconut_latent_moe_num_experts: int = field(
+        default=4,
+        metadata={"help": "Number of routed experts in latent MoE transition."},
+    )
+    coconut_latent_moe_top_k: int = field(
+        default=2,
+        metadata={"help": "Top-k experts selected by MoE router each latent step."},
+    )
+    coconut_latent_moe_use_shared_expert: bool = field(
+        default=True,
+        metadata={"help": "Whether to include shared expert branch in latent MoE transition."},
+    )
+    coconut_latent_moe_step_embed_max_steps: int = field(
+        default=32,
+        metadata={"help": "Max latent steps covered by MoE step embedding table."},
+    )
+    coconut_latent_moe_context_type: str = field(
+        default="prefix_last",
+        metadata={
+            "help": "Router context source for latent MoE. One of: none, prefix_last, disc."
+        },
+    )
 
 def main():
     if "RANK" in os.environ and dist.is_available() and not dist.is_initialized():
@@ -829,6 +1054,15 @@ def main():
             "COCONUT latent reasoning eval currently requires "
             "--per_device_eval_batch_size 1."
         )
+    if eval_args.use_coconut_latent_moe and (not eval_args.use_coconut_latent_reasoning):
+        raise ValueError(
+            "--use_coconut_latent_moe=True requires --use_coconut_latent_reasoning=True."
+        )
+    context_type = str(eval_args.coconut_latent_moe_context_type or "prefix_last").strip().lower()
+    if context_type not in {"none", "prefix_last", "disc"}:
+        raise ValueError(
+            "--coconut_latent_moe_context_type must be one of: none, prefix_last, disc."
+        )
     os.makedirs(data_args.encode_output_path, exist_ok=True)
 
     # --- Model Loading ---
@@ -852,7 +1086,7 @@ def main():
     processor = load_processor(model_args, data_args)
     if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
         processor.tokenizer.padding_side = "left"
-    model = _load_qwen_generation_model(model_args, processor)
+    model = _load_qwen_generation_model(model_args, processor, eval_args=eval_args)
     print_rank(f"[rank={local_rank}] Model loaded.")
 
     model.eval()

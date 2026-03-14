@@ -26,7 +26,7 @@ MODEL_PATH="${MODEL_PATH:-/home/share/yty_model/UME-R1/2B/UME-R1/2B}"
 ANNOTATION_PATH="${ANNOTATION_PATH:-/home/share/yty_data/UME_R1_train/UME-sft-train.jsonl}"
 MEDIA_ROOT="${MEDIA_ROOT:-/home/share/yty_data/vlm2vec_train}"
 # SUBSET_FILTER="${SUBSET_FILTER:-CIRR,MSCOCO_t2i,WebQA,ImageNet-1K,RefCOCO,InfographicsVQA}"  # empty = ALL datasets
-SUBSET_FILTER="${SUBSET_FILTER:-}"
+SUBSET_FILTER="${SUBSET_FILTER:-InfographicsVQA}"
 # ---------- Training hyperparams ----------
 # 8 nodes × 8 GPUs = 64 GPUs
 # effective_global_batch = 2 * 4 * 64 = 512
@@ -34,7 +34,7 @@ SUBSET_FILTER="${SUBSET_FILTER:-}"
 PER_DEVICE_BS="${PER_DEVICE_BS:-8}"
 GRAD_ACC="${GRAD_ACC:-4}"
 LR="${LR:-5e-5}"
-EPOCHS="${EPOCHS:-1}"
+EPOCHS="${EPOCHS:-5}"
 MAX_LEN="${MAX_LEN:-12288}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
@@ -48,6 +48,13 @@ VIDEO_MIN_FRAME_PIXELS="${VIDEO_MIN_FRAME_PIXELS:-784}"   # 4*28*28
 LORA_R="${LORA_R:-16}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
 LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj}"
+LATENT_MOE_ENABLE="${LATENT_MOE_ENABLE:-True}"
+LATENT_MOE_NUM_EXPERTS="${LATENT_MOE_NUM_EXPERTS:-4}"
+LATENT_MOE_TOP_K="${LATENT_MOE_TOP_K:-2}"
+LATENT_MOE_USE_SHARED_EXPERT="${LATENT_MOE_USE_SHARED_EXPERT:-True}"
+LATENT_MOE_BALANCE_LOSS_WEIGHT="${LATENT_MOE_BALANCE_LOSS_WEIGHT:-0.1}"
+LATENT_MOE_STEP_EMBED_MAX_STEPS="${LATENT_MOE_STEP_EMBED_MAX_STEPS:-32}"
+LATENT_MOE_CONTEXT_TYPE="${LATENT_MOE_CONTEXT_TYPE:-disc}"
 
 THINK_SEGMENTS="${THINK_SEGMENTS:-4}"
 CT_PER_SEG="${CT_PER_SEG:-1}"
@@ -102,6 +109,7 @@ echo "[MULTINODE] node_rank=${NODE_RANK}/${NNODES}, master=${MASTER_ADDR}:${MAST
 echo "[MULTINODE] total_gpus=${TOTAL_GPUS}, per_device_bs=${PER_DEVICE_BS}, grad_acc=${GRAD_ACC}"
 echo "[MULTINODE] effective_global_batch=${GLOBAL_BATCH}, contrastive_batch=${CONTRASTIVE_BATCH}"
 echo "[MULTINODE] pixels image=${MIN_PIXELS}~${MAX_PIXELS}, video_frame=${VIDEO_MIN_FRAME_PIXELS}~${VIDEO_MAX_FRAME_PIXELS}"
+echo "[MULTINODE] latent_moe enable=${LATENT_MOE_ENABLE}, experts=${LATENT_MOE_NUM_EXPERTS}, top_k=${LATENT_MOE_TOP_K}, ctx=${LATENT_MOE_CONTEXT_TYPE}, balance_w=${LATENT_MOE_BALANCE_LOSS_WEIGHT}"
 echo "[MULTINODE] output_dir=${OUTPUT_DIR}"
 echo "============================================="
 
@@ -145,6 +153,13 @@ torchrun \
   --dataloader_num_workers 0 \
   --save_total_limit 10 \
   --use_lora False \
+  --latent_moe_enable "${LATENT_MOE_ENABLE}" \
+  --latent_moe_num_experts "${LATENT_MOE_NUM_EXPERTS}" \
+  --latent_moe_top_k "${LATENT_MOE_TOP_K}" \
+  --latent_moe_use_shared_expert "${LATENT_MOE_USE_SHARED_EXPERT}" \
+  --latent_moe_balance_loss_weight "${LATENT_MOE_BALANCE_LOSS_WEIGHT}" \
+  --latent_moe_step_embed_max_steps "${LATENT_MOE_STEP_EMBED_MAX_STEPS}" \
+  --latent_moe_context_type "${LATENT_MOE_CONTEXT_TYPE}" \
   --tune_mm_llm True \
   --tune_mm_mlp True \
   --tune_mm_vision False \

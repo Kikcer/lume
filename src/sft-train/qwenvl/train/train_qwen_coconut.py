@@ -146,6 +146,7 @@ from qwenvl.data.data_coconut import (
     make_coconut_data_module,
 )
 from qwenvl.train.argument import DataArguments, ModelArguments, TrainingArguments
+from qwenvl.train.latent_moe import LatentMoETransition
 
 try:
     import torch.distributed.nn as dist_nn
@@ -286,6 +287,11 @@ def _get_backbone_model(model):
         except Exception:
             pass
     return raw_model.model if hasattr(raw_model, "model") else raw_model
+
+
+def _get_latent_moe_module(model):
+    raw_model = _unwrap_model(model)
+    return getattr(raw_model, "latent_moe_transition", None)
 
 
 def _normalize_qwen_position_ids(position_ids: torch.LongTensor) -> torch.LongTensor:
@@ -736,6 +742,9 @@ class CoconutTrainer(Trainer):
         contrastive_cross_device: bool = True,
         contrastive_local_loss: bool = True,
         debug_disc_oracle_pos_from_qry: bool = False,
+        latent_moe_enable: bool = False,
+        latent_moe_balance_loss_weight: float = 0.0,
+        latent_moe_context_type: str = "prefix_last",
         **kwargs,
     ):
         self.gen_emb_token_id = int(gen_emb_token_id)
@@ -746,6 +755,16 @@ class CoconutTrainer(Trainer):
         self.contrastive_cross_device = bool(contrastive_cross_device)
         self.contrastive_local_loss = bool(contrastive_local_loss)
         self.debug_disc_oracle_pos_from_qry = bool(debug_disc_oracle_pos_from_qry)
+        self.latent_moe_enable = bool(latent_moe_enable)
+        self.latent_moe_balance_loss_weight = float(latent_moe_balance_loss_weight)
+        context_type = str(latent_moe_context_type or "prefix_last").strip().lower()
+        if context_type not in {"none", "prefix_last", "disc"}:
+            raise ValueError(
+                "latent_moe_context_type must be one of: none, prefix_last, disc"
+            )
+        self.latent_moe_context_type = context_type
+        self._last_latent_moe_balance_loss = 0.0
+        self._last_latent_moe_router_entropy = 0.0
         super().__init__(*args, **kwargs)
 
     def _uses_subset_balanced_sampling(self, train_dataset: Optional[Dataset] = None) -> bool:
@@ -913,6 +932,7 @@ class CoconutTrainer(Trainer):
         last_hidden = prefix_hidden[:, -1, :]  # [1, D]
         if last_hidden.is_floating_point() and last_hidden.dtype != compute_dtype:
             last_hidden = last_hidden.to(dtype=compute_dtype)
+        prefix_last_hidden = last_hidden
 
         # Extract <disc_emb> from prefix
         disc_rep = _extract_last_token_rep(
@@ -957,8 +977,41 @@ class CoconutTrainer(Trainer):
 
         # 2) Latent loop
         latent_steps = int(max(latent_steps, 0))
-        for _ in range(latent_steps):
-            step_inputs_embeds = last_hidden.unsqueeze(1)  # [1, 1, D]
+        latent_moe_module = _get_latent_moe_module(model) if self.latent_moe_enable else None
+        if self.latent_moe_enable and latent_moe_module is None:
+            raise RuntimeError("latent_moe_enable=True but model has no latent_moe_transition module.")
+        balance_losses: List[torch.Tensor] = []
+        router_entropies: List[torch.Tensor] = []
+
+        for step_idx in range(latent_steps):
+            step_hidden = last_hidden
+            if latent_moe_module is not None:
+                if self.latent_moe_context_type == "none":
+                    router_context = None
+                elif self.latent_moe_context_type == "disc":
+                    if disc_rep is not None:
+                        router_context = disc_rep.unsqueeze(0) if disc_rep.ndim == 1 else disc_rep
+                    else:
+                        router_context = prefix_last_hidden
+                else:
+                    router_context = prefix_last_hidden
+
+                step_hidden, moe_aux = latent_moe_module(
+                    step_hidden,
+                    step_id=step_idx,
+                    context=router_context,
+                )
+                if step_hidden.is_floating_point() and step_hidden.dtype != compute_dtype:
+                    step_hidden = step_hidden.to(dtype=compute_dtype)
+                if isinstance(moe_aux, dict):
+                    balance_loss_t = moe_aux.get("balance_loss", None)
+                    entropy_t = moe_aux.get("router_entropy", None)
+                    if torch.is_tensor(balance_loss_t):
+                        balance_losses.append(balance_loss_t)
+                    if torch.is_tensor(entropy_t):
+                        router_entropies.append(entropy_t)
+
+            step_inputs_embeds = step_hidden.unsqueeze(1)  # [1, 1, D]
             if step_inputs_embeds.is_floating_point() and step_inputs_embeds.dtype != compute_dtype:
                 step_inputs_embeds = step_inputs_embeds.to(dtype=compute_dtype)
             # In simple latent loop, we don't increment position_ids for the latent step
@@ -1046,6 +1099,16 @@ class CoconutTrainer(Trainer):
             sample_loss = token_loss.sum() * 0.0
             valid_tokens = 0
 
+        moe_balance_loss = sample_loss.new_zeros(())
+        moe_router_entropy = sample_loss.new_zeros(())
+        if balance_losses:
+            moe_balance_loss = torch.stack(balance_losses).mean()
+            sample_loss = sample_loss + self.latent_moe_balance_loss_weight * moe_balance_loss
+        if router_entropies:
+            moe_router_entropy = torch.stack(router_entropies).mean()
+        self._last_latent_moe_balance_loss = float(moe_balance_loss.detach().item())
+        self._last_latent_moe_router_entropy = float(moe_router_entropy.detach().item())
+
         return sample_loss, latent_steps, valid_tokens, gen_rep, disc_rep
 
     def _run_side_batch(self, model, side_inputs: Dict[str, torch.Tensor]) -> Dict[str, object]:
@@ -1070,6 +1133,8 @@ class CoconutTrainer(Trainer):
         total_latent_steps = 0
         total_suffix_tokens = 0
         valid_samples = 0
+        total_latent_moe_balance_loss = 0.0
+        total_latent_moe_router_entropy = 0.0
         gen_reps: List[Optional[torch.Tensor]] = []
         disc_reps: List[Optional[torch.Tensor]] = []
 
@@ -1121,6 +1186,12 @@ class CoconutTrainer(Trainer):
             total_latent_steps += sample_latent_steps
             total_suffix_tokens += sample_suffix_tokens
             valid_samples += 1
+            total_latent_moe_balance_loss += float(
+                getattr(self, "_last_latent_moe_balance_loss", 0.0)
+            )
+            total_latent_moe_router_entropy += float(
+                getattr(self, "_last_latent_moe_router_entropy", 0.0)
+            )
             gen_reps.append(gen_rep)
             disc_reps.append(disc_rep)
 
@@ -1135,6 +1206,12 @@ class CoconutTrainer(Trainer):
             "total_latent_steps": total_latent_steps,
             "total_suffix_tokens": total_suffix_tokens,
             "valid_samples": valid_samples,
+            "avg_latent_moe_balance_loss": (
+                total_latent_moe_balance_loss / max(valid_samples, 1)
+            ),
+            "avg_latent_moe_router_entropy": (
+                total_latent_moe_router_entropy / max(valid_samples, 1)
+            ),
             "gen_reps": gen_reps,
             "disc_reps": disc_reps,
         }
@@ -1261,6 +1338,12 @@ class CoconutTrainer(Trainer):
         avg_suffix_tokens = (
             (qry_stats["total_suffix_tokens"] + pos_stats["total_suffix_tokens"]) / max(total_valid, 1)
         )
+        avg_latent_moe_balance_loss = (
+            qry_stats["avg_latent_moe_balance_loss"] + pos_stats["avg_latent_moe_balance_loss"]
+        ) / 2.0
+        avg_latent_moe_router_entropy = (
+            qry_stats["avg_latent_moe_router_entropy"] + pos_stats["avg_latent_moe_router_entropy"]
+        ) / 2.0
         dataset = getattr(self, "train_dataset", None)
         curriculum_state = None
         if isinstance(dataset, LazyCoconutSFTDataset):
@@ -1294,6 +1377,9 @@ class CoconutTrainer(Trainer):
                 "contrastive_pairs_global_gen": gen_global_pairs,
                 "contrastive_pairs_global_disc": disc_global_pairs,
                 "debug_disc_oracle_pos_from_qry": float(self.debug_disc_oracle_pos_from_qry),
+                "latent_moe_enable": float(self.latent_moe_enable),
+                "latent_moe_balance_loss": avg_latent_moe_balance_loss,
+                "latent_moe_router_entropy": avg_latent_moe_router_entropy,
             }
             if curriculum_state is not None:
                 log_payload.update(
@@ -1315,8 +1401,44 @@ class CoconutTrainer(Trainer):
             "disc_contrastive_loss": disc_contrastive_loss,
             "avg_latent_steps": avg_latent_steps,
             "avg_suffix_tokens": avg_suffix_tokens,
+            "latent_moe_balance_loss": ce_loss.new_tensor(avg_latent_moe_balance_loss),
+            "latent_moe_router_entropy": ce_loss.new_tensor(avg_latent_moe_router_entropy),
         }
         return (loss, outputs) if return_outputs else loss
+
+
+def initialize_latent_moe(model, model_args: ModelArguments):
+    raw_model = _unwrap_model(model)
+    if not bool(getattr(model_args, "latent_moe_enable", False)):
+        rank0_print("[COCONUT][LATENT-MOE] disabled")
+        return None
+
+    context_type = str(getattr(model_args, "latent_moe_context_type", "prefix_last")).strip().lower()
+    if context_type not in {"none", "prefix_last", "disc"}:
+        raise ValueError(
+            "latent_moe_context_type must be one of: none, prefix_last, disc"
+        )
+
+    hidden_size = int(raw_model.get_input_embeddings().weight.shape[1])
+    latent_moe = LatentMoETransition(
+        hidden_size=hidden_size,
+        num_experts=max(int(getattr(model_args, "latent_moe_num_experts", 4)), 1),
+        top_k=max(int(getattr(model_args, "latent_moe_top_k", 2)), 1),
+        use_shared_expert=bool(getattr(model_args, "latent_moe_use_shared_expert", True)),
+        step_embed_max_steps=max(int(getattr(model_args, "latent_moe_step_embed_max_steps", 32)), 1),
+    )
+    emb_weight = raw_model.get_input_embeddings().weight
+    latent_moe = latent_moe.to(dtype=emb_weight.dtype)
+    raw_model.latent_moe_transition = latent_moe
+    rank0_print(
+        "[COCONUT][LATENT-MOE] enabled: "
+        f"num_experts={latent_moe.num_experts}, top_k={latent_moe.top_k}, "
+        f"use_shared_expert={latent_moe.use_shared_expert}, "
+        f"step_embed_max_steps={latent_moe.step_embed_max_steps}, "
+        f"context_type={context_type}, "
+        f"balance_loss_weight={float(getattr(model_args, 'latent_moe_balance_loss_weight', 0.0))}"
+    )
+    return latent_moe
 
 
 def initialize_new_tokens(model, tokenizer, model_name: str, force_reinit_all: bool = False):
@@ -1730,6 +1852,8 @@ def train(attn_implementation: str = "flash_attention_2"):
         _unwrap_model(model).get_input_embeddings().requires_grad_(True)
         _get_lm_head(model).requires_grad_(True)
 
+    initialize_latent_moe(model, model_args)
+
     if (not dist.is_initialized()) or dist.get_rank() == 0:
         safe_print_trainable_parameters(model, use_lora=model_args.use_lora)
 
@@ -1776,6 +1900,13 @@ def train(attn_implementation: str = "flash_attention_2"):
         f"alpha={model_args.lora_alpha}, dropout={model_args.lora_dropout}, "
         f"use_dora={model_args.lora_use_dora}"
     )
+    rank0_print(
+        f"[COCONUT][TRAIN] latent_moe: enabled={model_args.latent_moe_enable}, "
+        f"num_experts={model_args.latent_moe_num_experts}, top_k={model_args.latent_moe_top_k}, "
+        f"use_shared_expert={model_args.latent_moe_use_shared_expert}, "
+        f"context_type={model_args.latent_moe_context_type}, "
+        f"balance_w={model_args.latent_moe_balance_loss_weight}"
+    )
     rank0_print("[COCONUT][TRAIN] =========================")
     gen_emb_token_id = tokenizer.convert_tokens_to_ids("<gen_emb>")
     disc_emb_token_id = tokenizer.convert_tokens_to_ids("<disc_emb>")
@@ -1791,6 +1922,9 @@ def train(attn_implementation: str = "flash_attention_2"):
         contrastive_cross_device=data_args.coconut_contrastive_cross_device,
         contrastive_local_loss=data_args.coconut_contrastive_local_loss,
         debug_disc_oracle_pos_from_qry=data_args.coconut_debug_disc_oracle_pos_from_qry,
+        latent_moe_enable=model_args.latent_moe_enable,
+        latent_moe_balance_loss_weight=model_args.latent_moe_balance_loss_weight,
+        latent_moe_context_type=model_args.latent_moe_context_type,
         callbacks=[stage_callback],
         **data_module,
     )
