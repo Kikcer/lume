@@ -31,7 +31,7 @@ set -euo pipefail
 prefix="${prefix:-/home/guohaiyun/yangtianyu}"
 UME_ROOT="${UME_ROOT:-$prefix/UME-R1}"
 
-CHECKPOINT="${CHECKPOINT:-$UME_ROOT/output/UME-R1-2B-Coconut-GC-Info-Continue-2026-03-13-22-46-55/checkpoint-830}"
+CHECKPOINT="${CHECKPOINT:-$UME_ROOT/output/UME-R1-2B-Coconut-Fulldata-NoAns-4node-2026-03-10-10-03-52/checkpoint-1431}"
 # MODEL_BASE: set to empty string to skip (for standalone models), or provide a base model path
 if [[ -z "${MODEL_BASE+x}" ]]; then
     # MODEL_BASE not set, use default
@@ -45,11 +45,12 @@ OUTPUT_BASEDIR="${OUTPUT_BASEDIR:-$UME_ROOT/output/Eval/UME-R1_2B}"
 LOG_DIR="${LOG_DIR:-$prefix/eval_log}"
                                                                                                                             
 # ---------- COCONUT Latent Config ----------
-USE_COCONUT_LATENT_REASONING="${USE_COCONUT_LATENT_REASONING:-False}"
+USE_COCONUT_LATENT_REASONING="${USE_COCONUT_LATENT_REASONING:-True}"
 # "auto" = read from trainer_state.json; or set a fixed integer
 COCONUT_LATENT_STEPS="${COCONUT_LATENT_STEPS:-4}"
 COCONUT_PREFIX_TEXT="${COCONUT_PREFIX_TEXT:-<think><bot>}"
-COCONUT_FORCED_SUFFIX_TEXT="${COCONUT_FORCED_SUFFIX_TEXT:-<eot></think><answer>}"
+COCONUT_FORCED_SUFFIX_TEXT="${COCONUT_FORCED_SUFFIX_TEXT:=<eot></think>
+<gen_emb>}"
 # Enable detailed token logging (may slow down evaluation)
 DEBUG_LOG_TOKENS="${DEBUG_LOG_TOKENS:-False}"
 
@@ -69,7 +70,7 @@ MAX_LEN="${MAX_LEN:-11288}"
 FORCE_REEVAL="${FORCE_REEVAL:-False}"
 
 # Filter specific datasets (comma-separated). Empty = all datasets in yaml.
-DATASET_NAMES="${DATASET_NAMES:-InfographicsVQA}"
+DATASET_NAMES="${DATASET_NAMES:-}"
 
 # Modalities and their yaml configs
 # Override via env: MODALITIES="image" or MODALITIES="image,video"

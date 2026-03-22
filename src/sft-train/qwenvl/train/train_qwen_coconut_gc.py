@@ -93,9 +93,7 @@ class CoconutGradientCheckpointTrainer(coconut_base.CoconutTrainer):
                 video_grid_thw=video_grid_thw,
             )
 
-        embed_weight = coconut_base._unwrap_model(model).get_input_embeddings().weight
-        hidden_size = int(embed_weight.shape[1])
-        rep_dtype = embed_weight.dtype
+        hidden_size, rep_dtype = self._get_rep_meta_cached(model)
 
         def _forward_fn(
             prefix_input_ids_t,
@@ -357,6 +355,10 @@ def train(attn_implementation: str = "flash_attention_2"):
         f"[COCONUT-GC][TRAIN] lora: enabled={model_args.use_lora}, r={model_args.lora_r}, "
         f"alpha={model_args.lora_alpha}, dropout={model_args.lora_dropout}, "
         f"use_dora={model_args.lora_use_dora}"
+    )
+    coconut_base.rank0_print(
+        f"[COCONUT-GC][TRAIN] deepspeed_enabled={coconut_base._is_deepspeed_enabled(training_args)}, "
+        f"deepspeed_cfg={getattr(training_args, 'deepspeed', None)}"
     )
     coconut_base.rank0_print(
         f"[COCONUT-GC][TRAIN] latent_moe: enabled={model_args.latent_moe_enable}, "

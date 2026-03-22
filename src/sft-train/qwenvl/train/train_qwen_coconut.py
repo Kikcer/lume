@@ -106,8 +106,10 @@ CUDA_VISIBLE_DEVICES=0 WANDB_MODE=disabled /home/guohaiyun/anaconda3/envs/ume-r1
 import logging
 import os
 import pathlib
+import re
 import sys
 import importlib.util
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -160,6 +162,77 @@ IGNORE_INDEX = -100
 def rank0_print(*args):
     if (not dist.is_initialized()) or dist.get_rank() == 0:
         print(*args)
+
+
+def _debug_cuda_memory_enabled() -> bool:
+    return str(os.environ.get("COCONUT_DEBUG_MEMORY", "0")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _get_rank_str() -> str:
+    if dist.is_available() and dist.is_initialized():
+        try:
+            return f"rank{dist.get_rank()}"
+        except Exception:
+            pass
+    if local_rank is not None:
+        return f"local_rank{local_rank}"
+    return "rank?"
+
+
+def _log_cuda_memory(tag: str, **kwargs) -> None:
+    if (not _debug_cuda_memory_enabled()) or (not torch.cuda.is_available()):
+        return
+    try:
+        device = torch.device("cuda", torch.cuda.current_device())
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        alloc_gb = torch.cuda.memory_allocated(device) / (1024 ** 3)
+        reserved_gb = torch.cuda.memory_reserved(device) / (1024 ** 3)
+        peak_alloc_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+        peak_reserved_gb = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
+        free_gb = free_bytes / (1024 ** 3)
+        total_gb = total_bytes / (1024 ** 3)
+        extra = " ".join(f"{k}={v}" for k, v in kwargs.items())
+        print(
+            f"[COCONUT][MEM][{_get_rank_str()}][{tag}] "
+            f"alloc={alloc_gb:.2f}GB reserved={reserved_gb:.2f}GB "
+            f"peak_alloc={peak_alloc_gb:.2f}GB peak_reserved={peak_reserved_gb:.2f}GB "
+            f"free={free_gb:.2f}GB total={total_gb:.2f}GB"
+            + (f" {extra}" if extra else ""),
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[COCONUT][MEM][{_get_rank_str()}][{tag}] failed_to_log={e}", flush=True)
+
+
+def _is_deepspeed_enabled(training_args) -> bool:
+    return bool(getattr(training_args, "deepspeed", None))
+
+
+def _zero3_gathered_parameters(params):
+    if params is None:
+        return nullcontext()
+    ds_params = [
+        p for p in params if torch.is_tensor(p) and hasattr(p, "ds_id")
+    ]
+    if not ds_params:
+        return nullcontext()
+    return GatheredParameters(ds_params, modifier_rank=None)
+
+
+def _build_loss_anchor(model, fallback_loss: torch.Tensor) -> torch.Tensor:
+    for param in model.parameters():
+        if (not param.requires_grad) or (not torch.is_tensor(param)):
+            continue
+        with _zero3_gathered_parameters([param]):
+            if param.numel() <= 0:
+                continue
+            return param.reshape(-1)[:1].sum() * 0.0
+    return fallback_loss * 0.0
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
@@ -291,7 +364,32 @@ def _get_backbone_model(model):
 
 def _get_latent_moe_module(model):
     raw_model = _unwrap_model(model)
-    return getattr(raw_model, "latent_moe_transition", None)
+    candidate_modules = []
+    if raw_model is not None:
+        candidate_modules.append(raw_model)
+    if hasattr(raw_model, "get_base_model"):
+        try:
+            base_model = raw_model.get_base_model()
+            if base_model is not None:
+                candidate_modules.append(base_model)
+        except Exception:
+            pass
+    backbone_model = _get_backbone_model(model)
+    if backbone_model is not None:
+        candidate_modules.append(backbone_model)
+
+    seen = set()
+    for candidate in candidate_modules:
+        if candidate is None:
+            continue
+        cid = id(candidate)
+        if cid in seen:
+            continue
+        seen.add(cid)
+        module = getattr(candidate, "latent_moe_transition", None)
+        if module is not None:
+            return module
+    return None
 
 
 def _normalize_qwen_position_ids(position_ids: torch.LongTensor) -> torch.LongTensor:
@@ -765,7 +863,34 @@ class CoconutTrainer(Trainer):
         self.latent_moe_context_type = context_type
         self._last_latent_moe_balance_loss = 0.0
         self._last_latent_moe_router_entropy = 0.0
+        self._cached_hidden_size: Optional[int] = None
+        self._cached_rep_dtype: Optional[torch.dtype] = None
+        self._cached_compute_dtype: Optional[torch.dtype] = None
         super().__init__(*args, **kwargs)
+
+    def _get_compute_dtype_cached(self, model) -> torch.dtype:
+        if self._cached_compute_dtype is None:
+            self._cached_compute_dtype = _infer_compute_dtype(model)
+        return self._cached_compute_dtype
+
+    def _get_rep_meta_cached(self, model) -> tuple[int, torch.dtype]:
+        if self._cached_hidden_size is None:
+            raw_model = _unwrap_model(model)
+            model_config = getattr(raw_model, "config", None)
+            hidden_size = getattr(model_config, "hidden_size", None)
+            if hidden_size is None and model_config is not None:
+                hidden_size = getattr(getattr(model_config, "text_config", None), "hidden_size", None)
+            if hidden_size is None:
+                emb = getattr(raw_model, "get_input_embeddings", lambda: None)()
+                emb_weight = getattr(emb, "weight", None)
+                with _zero3_gathered_parameters([emb_weight] if emb_weight is not None else None):
+                    if emb_weight is None:
+                        raise RuntimeError("Cannot infer hidden size for contrastive representation.")
+                    hidden_size = int(emb_weight.shape[1])
+            self._cached_hidden_size = int(hidden_size)
+        if self._cached_rep_dtype is None:
+            self._cached_rep_dtype = self._get_compute_dtype_cached(model)
+        return self._cached_hidden_size, self._cached_rep_dtype
 
     def _uses_subset_balanced_sampling(self, train_dataset: Optional[Dataset] = None) -> bool:
         if train_dataset is None:
@@ -868,7 +993,8 @@ class CoconutTrainer(Trainer):
 
         device = prefix_input_ids.device
         lm_head = _get_lm_head(model)
-        compute_dtype = _infer_compute_dtype(model)
+        compute_dtype = self._get_compute_dtype_cached(model)
+        current_stage = "init"
 
         prefix_position_ids = _normalize_qwen_position_ids(prefix_position_ids)
         suffix_position_ids = _normalize_qwen_position_ids(suffix_position_ids)
@@ -898,218 +1024,268 @@ class CoconutTrainer(Trainer):
         if video_grid_thw is not None:
             model_kwargs["video_grid_thw"] = video_grid_thw
 
-        # 1) Prefix
-        # Visual inputs can only be consumed by the CausalLM wrapper forward
-        # (it inserts image/video features into text embeddings).
-        # For pure-text prefix, use backbone to avoid materializing LM logits.
-        raw_model = _unwrap_model(model)
-        backbone_model = _get_backbone_model(model)
-        has_visual_inputs = any(
-            key in model_kwargs
-            for key in ("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw")
-        )
-        if has_visual_inputs:
-            prefix_out = raw_model(
-                input_ids=prefix_input_ids,
-                attention_mask=prefix_attention_mask,
-                position_ids=prefix_position_ids,
-                use_cache=True,
-                output_hidden_states=True,
-                return_dict=True,
-                **model_kwargs,
+        try:
+            # 1) Prefix
+            # Visual inputs can only be consumed by the CausalLM wrapper forward
+            # (it inserts image/video features into text embeddings).
+            # For pure-text prefix, use backbone to avoid materializing LM logits.
+            raw_model = _unwrap_model(model)
+            backbone_model = _get_backbone_model(model)
+            has_visual_inputs = any(
+                key in model_kwargs
+                for key in ("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw")
             )
-            prefix_hidden = prefix_out.hidden_states[-1]
-        else:
-            prefix_out = backbone_model(
-                input_ids=prefix_input_ids,
-                attention_mask=prefix_attention_mask,
-                position_ids=prefix_position_ids,
-                use_cache=True,
-                return_dict=True,
+            _log_cuda_memory(
+                "single_sample_start",
+                prefix_len=int(prefix_input_ids.shape[1]),
+                suffix_len=int(suffix_input_ids.shape[1]),
+                latent_steps=int(latent_steps),
+                has_visual=bool(has_visual_inputs),
             )
-            prefix_hidden = prefix_out.last_hidden_state
-        past_key_values = _cast_past_key_values_dtype(prefix_out.past_key_values, compute_dtype)
-        last_hidden = prefix_hidden[:, -1, :]  # [1, D]
-        if last_hidden.is_floating_point() and last_hidden.dtype != compute_dtype:
-            last_hidden = last_hidden.to(dtype=compute_dtype)
-        prefix_last_hidden = last_hidden
-
-        # Extract <disc_emb> from prefix
-        disc_rep = _extract_last_token_rep(
-            prefix_hidden[0], prefix_input_ids[0], self.disc_emb_token_id
-        )
-
-        # --- DEBUG: disc_emb position info (first 5 steps) ---
-        if not hasattr(self, '_debug_prefix_step'):
-            self._debug_prefix_step = 0
-        self._debug_prefix_step += 1
-        if self._debug_prefix_step <= 20:
-            disc_positions = torch.nonzero(prefix_input_ids[0] == self.disc_emb_token_id, as_tuple=False).flatten()
-            gen_positions = torch.nonzero(prefix_input_ids[0] == self.gen_emb_token_id, as_tuple=False).flatten()
-            IMAGE_PAD_ID = 151655
-            VIDEO_PAD_ID = 151656
-            n_img_pad = int((prefix_input_ids[0] == IMAGE_PAD_ID).sum().item())
-            n_vid_pad = int((prefix_input_ids[0] == VIDEO_PAD_ID).sum().item())
-            pv_shape = model_kwargs.get("pixel_values", None)
-            pv_shape = tuple(pv_shape.shape) if pv_shape is not None else None
-            ig_shape = model_kwargs.get("image_grid_thw", None)
-            ig_shape = tuple(ig_shape.shape) if ig_shape is not None else None
-            pvv_shape = model_kwargs.get("pixel_values_videos", None)
-            pvv_shape = tuple(pvv_shape.shape) if pvv_shape is not None else None
-            rank0_print(
-                f"[DEBUG-PREFIX] sample={self._debug_prefix_step} "
-                f"prefix_len={prefix_input_ids.shape[1]} "
-                f"disc_emb_positions={disc_positions.tolist()} "
-                f"gen_emb_in_prefix={gen_positions.tolist()} "
-                f"disc_rep_is_none={disc_rep is None} "
-                f"has_visual={has_visual_inputs} "
-                f"n_img_pad_in_prefix={n_img_pad} n_vid_pad_in_prefix={n_vid_pad} "
-                f"pixel_values_shape={pv_shape} image_grid_thw_shape={ig_shape} "
-                f"pixel_values_videos_shape={pvv_shape}"
-            )
-
-        # IMPORTANT: Qwen2-VL expands <|image_pad|> into multiple tokens.
-        # Use kv-cache length as the true processed length.
-        if hasattr(past_key_values, "get_seq_length"):
-            processed_len = int(past_key_values.get_seq_length())
-        else:
-            processed_len = int(past_key_values[0][0].shape[2])
-
-        # 2) Latent loop
-        latent_steps = int(max(latent_steps, 0))
-        latent_moe_module = _get_latent_moe_module(model) if self.latent_moe_enable else None
-        if self.latent_moe_enable and latent_moe_module is None:
-            raise RuntimeError("latent_moe_enable=True but model has no latent_moe_transition module.")
-        balance_losses: List[torch.Tensor] = []
-        router_entropies: List[torch.Tensor] = []
-
-        for step_idx in range(latent_steps):
-            step_hidden = last_hidden
-            if latent_moe_module is not None:
-                if self.latent_moe_context_type == "none":
-                    router_context = None
-                elif self.latent_moe_context_type == "disc":
-                    if disc_rep is not None:
-                        router_context = disc_rep.unsqueeze(0) if disc_rep.ndim == 1 else disc_rep
-                    else:
-                        router_context = prefix_last_hidden
-                else:
-                    router_context = prefix_last_hidden
-
-                step_hidden, moe_aux = latent_moe_module(
-                    step_hidden,
-                    step_id=step_idx,
-                    context=router_context,
+            current_stage = "prefix_forward"
+            if has_visual_inputs:
+                prefix_out = raw_model(
+                    input_ids=prefix_input_ids,
+                    attention_mask=prefix_attention_mask,
+                    position_ids=prefix_position_ids,
+                    use_cache=True,
+                    output_hidden_states=True,
+                    return_dict=True,
+                    **model_kwargs,
                 )
-                if step_hidden.is_floating_point() and step_hidden.dtype != compute_dtype:
-                    step_hidden = step_hidden.to(dtype=compute_dtype)
-                if isinstance(moe_aux, dict):
-                    balance_loss_t = moe_aux.get("balance_loss", None)
-                    entropy_t = moe_aux.get("router_entropy", None)
-                    if torch.is_tensor(balance_loss_t):
-                        balance_losses.append(balance_loss_t)
-                    if torch.is_tensor(entropy_t):
-                        router_entropies.append(entropy_t)
-
-            step_inputs_embeds = step_hidden.unsqueeze(1)  # [1, 1, D]
-            if step_inputs_embeds.is_floating_point() and step_inputs_embeds.dtype != compute_dtype:
-                step_inputs_embeds = step_inputs_embeds.to(dtype=compute_dtype)
-            # In simple latent loop, we don't increment position_ids for the latent step
-            # or we do if model relies on absolute cache_position.
-            # COCONUT uses cache_position to track sequence progress.
-            step_cache_position = torch.tensor([processed_len], dtype=torch.long, device=device)
-            # Position IDs for latent: we use the next position after prefix
-            # For Qwen2-VL RoPE 2D, we typically just need the 1D absolute position if it's text-like
-            step_position_ids = torch.full(
-                (3, 1, 1), processed_len, dtype=torch.long, device=device
+                prefix_hidden = prefix_out.hidden_states[-1]
+            else:
+                prefix_out = backbone_model(
+                    input_ids=prefix_input_ids,
+                    attention_mask=prefix_attention_mask,
+                    position_ids=prefix_position_ids,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                prefix_hidden = prefix_out.last_hidden_state
+            _log_cuda_memory(
+                "after_prefix_forward",
+                prefix_len=int(prefix_input_ids.shape[1]),
+                image_shape=(tuple(pixel_values.shape) if torch.is_tensor(pixel_values) else None),
+                video_shape=(tuple(pixel_values_videos.shape) if torch.is_tensor(pixel_values_videos) else None),
             )
-
-            step_out = backbone_model(
-                input_ids=None,
-                inputs_embeds=step_inputs_embeds,
-                past_key_values=past_key_values,
-                position_ids=step_position_ids,
-                use_cache=True,
-                return_dict=True,
-                cache_position=step_cache_position,
-            )
-            past_key_values = _cast_past_key_values_dtype(step_out.past_key_values, compute_dtype)
-            last_hidden = step_out.last_hidden_state[:, -1, :]
+            past_key_values = _cast_past_key_values_dtype(prefix_out.past_key_values, compute_dtype)
+            last_hidden = prefix_hidden[:, -1, :]  # [1, D]
             if last_hidden.is_floating_point() and last_hidden.dtype != compute_dtype:
                 last_hidden = last_hidden.to(dtype=compute_dtype)
-            processed_len += 1
+            prefix_last_hidden = last_hidden
 
-        # 3) Suffix
-        suffix_len = suffix_input_ids.shape[1]
-        suffix_cache_position = torch.arange(
-            processed_len, processed_len + suffix_len, dtype=torch.long, device=device
-        )
-        suffix_out = backbone_model(
-            input_ids=suffix_input_ids,
-            attention_mask=suffix_attention_mask,
-            position_ids=suffix_position_ids,
-            past_key_values=past_key_values,
-            use_cache=True,
-            return_dict=True,
-            cache_position=suffix_cache_position,
-        )
-        suffix_hidden = suffix_out.last_hidden_state
-
-        # Extract <gen_emb> from suffix
-        gen_rep = _extract_last_token_rep(
-            suffix_hidden[0], suffix_input_ids[0], self.gen_emb_token_id
-        )
-
-        # --- DEBUG: gen_emb position in suffix ---
-        if self._debug_prefix_step <= 20:
-            gen_suffix_positions = torch.nonzero(suffix_input_ids[0] == self.gen_emb_token_id, as_tuple=False).flatten()
-            disc_suffix_positions = torch.nonzero(suffix_input_ids[0] == self.disc_emb_token_id, as_tuple=False).flatten()
-            rank0_print(
-                f"[DEBUG-SUFFIX] sample={self._debug_prefix_step} "
-                f"suffix_len={suffix_input_ids.shape[1]} "
-                f"gen_emb_positions={gen_suffix_positions.tolist()} "
-                f"disc_emb_in_suffix={disc_suffix_positions.tolist()} "
-                f"gen_rep_is_none={gen_rep is None} "
-                f"latent_steps={latent_steps}"
+            # Extract <disc_emb> from prefix
+            disc_rep = _extract_last_token_rep(
+                prefix_hidden[0], prefix_input_ids[0], self.disc_emb_token_id
             )
 
-        # CE Loss on suffix
-        # Alignment: first token of suffix_input_ids is predicted by the LAST latent hidden state
-        # The logits from suffix_out are shifted by 1 relative to inputs.
-        first_logits = lm_head(last_hidden).unsqueeze(1)  # [1, 1, V]
-        suffix_logits = lm_head(suffix_hidden)
-        if suffix_logits.shape[1] > 1:
-            logits = torch.cat([first_logits, suffix_logits[:, :-1, :]], dim=1)
-        else:
-            logits = first_logits
+            # --- DEBUG: disc_emb position info (first 20 steps) ---
+            if not hasattr(self, "_debug_prefix_step"):
+                self._debug_prefix_step = 0
+            self._debug_prefix_step += 1
+            if self._debug_prefix_step <= 20:
+                disc_positions = torch.nonzero(
+                    prefix_input_ids[0] == self.disc_emb_token_id, as_tuple=False
+                ).flatten()
+                gen_positions = torch.nonzero(
+                    prefix_input_ids[0] == self.gen_emb_token_id, as_tuple=False
+                ).flatten()
+                IMAGE_PAD_ID = 151655
+                VIDEO_PAD_ID = 151656
+                n_img_pad = int((prefix_input_ids[0] == IMAGE_PAD_ID).sum().item())
+                n_vid_pad = int((prefix_input_ids[0] == VIDEO_PAD_ID).sum().item())
+                pv_shape = model_kwargs.get("pixel_values", None)
+                pv_shape = tuple(pv_shape.shape) if pv_shape is not None else None
+                ig_shape = model_kwargs.get("image_grid_thw", None)
+                ig_shape = tuple(ig_shape.shape) if ig_shape is not None else None
+                pvv_shape = model_kwargs.get("pixel_values_videos", None)
+                pvv_shape = tuple(pvv_shape.shape) if pvv_shape is not None else None
+                rank0_print(
+                    f"[DEBUG-PREFIX] sample={self._debug_prefix_step} "
+                    f"prefix_len={prefix_input_ids.shape[1]} "
+                    f"disc_emb_positions={disc_positions.tolist()} "
+                    f"gen_emb_in_prefix={gen_positions.tolist()} "
+                    f"disc_rep_is_none={disc_rep is None} "
+                    f"has_visual={has_visual_inputs} "
+                    f"n_img_pad_in_prefix={n_img_pad} n_vid_pad_in_prefix={n_vid_pad} "
+                    f"pixel_values_shape={pv_shape} image_grid_thw_shape={ig_shape} "
+                    f"pixel_values_videos_shape={pvv_shape}"
+                )
 
-        # suffix_labels: [1, seq_suffix], IGNORE_INDEX where not supervised
-        token_loss = F.cross_entropy(
-            logits.float().view(-1, logits.shape[-1]),
-            suffix_labels.view(-1),
-            reduction="none",
-        ).view(1, -1)
+            # IMPORTANT: Qwen2-VL expands <|image_pad|> into multiple tokens.
+            # Use kv-cache length as the true processed length.
+            if hasattr(past_key_values, "get_seq_length"):
+                processed_len = int(past_key_values.get_seq_length())
+            else:
+                processed_len = int(past_key_values[0][0].shape[2])
 
-        valid_mask = suffix_labels.ne(IGNORE_INDEX)
-        if valid_mask.sum() > 0:
-            sample_loss = token_loss[valid_mask].mean()
-            valid_tokens = int(valid_mask.sum().item())
-        else:
-            # If no labels (should not happen in SFT), return dummy zero
-            sample_loss = token_loss.sum() * 0.0
-            valid_tokens = 0
+            # 2) Latent loop
+            latent_steps = int(max(latent_steps, 0))
+            latent_moe_module = _get_latent_moe_module(model) if self.latent_moe_enable else None
+            if self.latent_moe_enable and latent_moe_module is None:
+                raise RuntimeError("latent_moe_enable=True but model has no latent_moe_transition module.")
+            balance_losses: List[torch.Tensor] = []
+            router_entropies: List[torch.Tensor] = []
 
-        moe_balance_loss = sample_loss.new_zeros(())
-        moe_router_entropy = sample_loss.new_zeros(())
-        if balance_losses:
-            moe_balance_loss = torch.stack(balance_losses).mean()
-            sample_loss = sample_loss + self.latent_moe_balance_loss_weight * moe_balance_loss
-        if router_entropies:
-            moe_router_entropy = torch.stack(router_entropies).mean()
-        self._last_latent_moe_balance_loss = float(moe_balance_loss.detach().item())
-        self._last_latent_moe_router_entropy = float(moe_router_entropy.detach().item())
+            current_stage = "latent_loop"
+            for step_idx in range(latent_steps):
+                step_hidden = last_hidden
+                if latent_moe_module is not None:
+                    if self.latent_moe_context_type == "none":
+                        router_context = None
+                    elif self.latent_moe_context_type == "disc":
+                        if disc_rep is not None:
+                            router_context = disc_rep.unsqueeze(0) if disc_rep.ndim == 1 else disc_rep
+                        else:
+                            router_context = prefix_last_hidden
+                    else:
+                        router_context = prefix_last_hidden
+                    step_hidden, moe_aux = latent_moe_module(
+                        step_hidden,
+                        step_id=step_idx,
+                        context=router_context,
+                    )
+                    if step_hidden.is_floating_point() and step_hidden.dtype != compute_dtype:
+                        step_hidden = step_hidden.to(dtype=compute_dtype)
+                    if isinstance(moe_aux, dict):
+                        balance_loss_t = moe_aux.get("balance_loss", None)
+                        entropy_t = moe_aux.get("router_entropy", None)
+                        if torch.is_tensor(balance_loss_t):
+                            balance_losses.append(balance_loss_t)
+                        if torch.is_tensor(entropy_t):
+                            router_entropies.append(entropy_t)
 
-        return sample_loss, latent_steps, valid_tokens, gen_rep, disc_rep
+                step_inputs_embeds = step_hidden.unsqueeze(1)  # [1, 1, D]
+                if step_inputs_embeds.is_floating_point() and step_inputs_embeds.dtype != compute_dtype:
+                    step_inputs_embeds = step_inputs_embeds.to(dtype=compute_dtype)
+                # In simple latent loop, we don't increment position_ids for the latent step
+                # or we do if model relies on absolute cache_position.
+                # COCONUT uses cache_position to track sequence progress.
+                step_cache_position = torch.tensor([processed_len], dtype=torch.long, device=device)
+                # Position IDs for latent: we use the next position after prefix
+                # For Qwen2-VL RoPE 2D, we typically just need the 1D absolute position if it's text-like
+                step_position_ids = torch.full(
+                    (3, 1, 1), processed_len, dtype=torch.long, device=device
+                )
+
+                step_out = backbone_model(
+                    input_ids=None,
+                    inputs_embeds=step_inputs_embeds,
+                    past_key_values=past_key_values,
+                    position_ids=step_position_ids,
+                    use_cache=True,
+                    return_dict=True,
+                    cache_position=step_cache_position,
+                )
+                past_key_values = _cast_past_key_values_dtype(step_out.past_key_values, compute_dtype)
+                last_hidden = step_out.last_hidden_state[:, -1, :]
+                if last_hidden.is_floating_point() and last_hidden.dtype != compute_dtype:
+                    last_hidden = last_hidden.to(dtype=compute_dtype)
+                processed_len += 1
+            _log_cuda_memory("after_latent_loop", processed_len=processed_len, latent_steps=latent_steps)
+
+            # 3) Suffix
+            current_stage = "suffix_forward"
+            suffix_len = suffix_input_ids.shape[1]
+            suffix_cache_position = torch.arange(
+                processed_len, processed_len + suffix_len, dtype=torch.long, device=device
+            )
+            suffix_out = backbone_model(
+                input_ids=suffix_input_ids,
+                attention_mask=suffix_attention_mask,
+                position_ids=suffix_position_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_dict=True,
+                cache_position=suffix_cache_position,
+            )
+            suffix_hidden = suffix_out.last_hidden_state
+            _log_cuda_memory("after_suffix_forward", suffix_len=suffix_len)
+
+            # Extract <gen_emb> from suffix
+            gen_rep = _extract_last_token_rep(
+                suffix_hidden[0], suffix_input_ids[0], self.gen_emb_token_id
+            )
+
+            # --- DEBUG: gen_emb position in suffix ---
+            if self._debug_prefix_step <= 20:
+                gen_suffix_positions = torch.nonzero(
+                    suffix_input_ids[0] == self.gen_emb_token_id, as_tuple=False
+                ).flatten()
+                disc_suffix_positions = torch.nonzero(
+                    suffix_input_ids[0] == self.disc_emb_token_id, as_tuple=False
+                ).flatten()
+                rank0_print(
+                    f"[DEBUG-SUFFIX] sample={self._debug_prefix_step} "
+                    f"suffix_len={suffix_input_ids.shape[1]} "
+                    f"gen_emb_positions={gen_suffix_positions.tolist()} "
+                    f"disc_emb_in_suffix={disc_suffix_positions.tolist()} "
+                    f"gen_rep_is_none={gen_rep is None} "
+                    f"latent_steps={latent_steps}"
+                )
+
+            # CE Loss on suffix
+            # Alignment: first token of suffix_input_ids is predicted by the LAST latent hidden state
+            # The logits from suffix_out are shifted by 1 relative to inputs.
+            current_stage = "lm_head"
+            with _zero3_gathered_parameters(list(lm_head.parameters(recurse=False))):
+                first_logits = lm_head(last_hidden).unsqueeze(1)  # [1, 1, V]
+                suffix_logits = lm_head(suffix_hidden)
+            if suffix_logits.shape[1] > 1:
+                logits = torch.cat([first_logits, suffix_logits[:, :-1, :]], dim=1)
+            else:
+                logits = first_logits
+            _log_cuda_memory(
+                "after_lm_head",
+                logits_shape=tuple(logits.shape),
+                logits_gb=f"{(logits.numel() * logits.element_size()) / (1024 ** 3):.2f}",
+            )
+
+            # suffix_labels: [1, seq_suffix], IGNORE_INDEX where not supervised
+            current_stage = "cross_entropy"
+            token_loss = F.cross_entropy(
+                logits.float().view(-1, logits.shape[-1]),
+                suffix_labels.view(-1),
+                reduction="none",
+            ).view(1, -1)
+            _log_cuda_memory(
+                "after_cross_entropy",
+                token_loss_shape=tuple(token_loss.shape),
+            )
+
+            valid_mask = suffix_labels.ne(IGNORE_INDEX)
+            if valid_mask.sum() > 0:
+                sample_loss = token_loss[valid_mask].mean()
+                valid_tokens = int(valid_mask.sum().item())
+            else:
+                # If no labels (should not happen in SFT), return dummy zero
+                sample_loss = token_loss.sum() * 0.0
+                valid_tokens = 0
+
+            moe_balance_loss = sample_loss.new_zeros(())
+            moe_router_entropy = sample_loss.new_zeros(())
+            if balance_losses:
+                moe_balance_loss = torch.stack(balance_losses).mean()
+                sample_loss = sample_loss + self.latent_moe_balance_loss_weight * moe_balance_loss
+            if router_entropies:
+                moe_router_entropy = torch.stack(router_entropies).mean()
+            self._last_latent_moe_balance_loss = float(moe_balance_loss.detach().item())
+            self._last_latent_moe_router_entropy = float(moe_router_entropy.detach().item())
+            _log_cuda_memory("single_sample_done", valid_tokens=valid_tokens)
+
+            return sample_loss, latent_steps, valid_tokens, gen_rep, disc_rep
+        except torch.OutOfMemoryError:
+            _log_cuda_memory(
+                "oom",
+                stage=current_stage,
+                prefix_len=int(prefix_input_ids.shape[1]),
+                suffix_len=int(suffix_input_ids.shape[1]),
+                latent_steps=int(latent_steps),
+                image_shape=(tuple(pixel_values.shape) if torch.is_tensor(pixel_values) else None),
+                video_shape=(tuple(pixel_values_videos.shape) if torch.is_tensor(pixel_values_videos) else None),
+            )
+            raise
 
     def _run_side_batch(self, model, side_inputs: Dict[str, torch.Tensor]) -> Dict[str, object]:
         prefix_ids = side_inputs["prefix_input_ids"]
@@ -1223,17 +1399,15 @@ class CoconutTrainer(Trainer):
         ce_loss = (qry_stats["ce_loss"] + pos_stats["ce_loss"])
         real_pair = inputs.get("coconut_real_pair", None)
 
-        # Defensive: Ensure ce_loss has a grad_fn even if it's 0.0
-        # This is critical for DDP when some ranks might have 0 valid samples.
-        dummy_grad = sum(p.sum() * 0.0 for p in model.parameters() if p.requires_grad)
-        ce_loss = ce_loss + dummy_grad
+        # Ensure ce_loss keeps grad_fn even when rank-local valid samples are empty.
+        # Use one small anchor tensor instead of scanning all trainable params
+        # (full scans are expensive and fragile under ZeRO-3 partition/offload).
+        ce_loss = ce_loss + _build_loss_anchor(model, ce_loss)
 
         pair_count = len(qry_stats["gen_reps"])
         zero = ce_loss * 0.0
         if pair_count > 0:
-            embed_weight = _unwrap_model(model).get_input_embeddings().weight
-            hidden_size = int(embed_weight.shape[1])
-            rep_dtype = embed_weight.dtype
+            hidden_size, rep_dtype = self._get_rep_meta_cached(model)
             rep_device = ce_loss.device
 
             if real_pair is None:
@@ -1419,22 +1593,34 @@ def initialize_latent_moe(model, model_args: ModelArguments):
             "latent_moe_context_type must be one of: none, prefix_last, disc"
         )
 
-    hidden_size = int(raw_model.get_input_embeddings().weight.shape[1])
+    module_owner = raw_model
+    if hasattr(raw_model, "get_base_model"):
+        try:
+            module_owner = raw_model.get_base_model()
+        except Exception:
+            module_owner = raw_model
+
+    embedding_owner = module_owner if hasattr(module_owner, "get_input_embeddings") else raw_model
+    hidden_size = int(embedding_owner.get_input_embeddings().weight.shape[1])
     latent_moe = LatentMoETransition(
         hidden_size=hidden_size,
         num_experts=max(int(getattr(model_args, "latent_moe_num_experts", 4)), 1),
         top_k=max(int(getattr(model_args, "latent_moe_top_k", 2)), 1),
         use_shared_expert=bool(getattr(model_args, "latent_moe_use_shared_expert", True)),
         step_embed_max_steps=max(int(getattr(model_args, "latent_moe_step_embed_max_steps", 32)), 1),
+        expert_dropout=max(float(getattr(model_args, "latent_moe_expert_dropout", 0.0)), 0.0),
     )
-    emb_weight = raw_model.get_input_embeddings().weight
+    emb_weight = embedding_owner.get_input_embeddings().weight
     latent_moe = latent_moe.to(dtype=emb_weight.dtype)
-    raw_model.latent_moe_transition = latent_moe
+    module_owner.latent_moe_transition = latent_moe
+    if module_owner is not raw_model:
+        raw_model.latent_moe_transition = latent_moe
     rank0_print(
         "[COCONUT][LATENT-MOE] enabled: "
         f"num_experts={latent_moe.num_experts}, top_k={latent_moe.top_k}, "
         f"use_shared_expert={latent_moe.use_shared_expert}, "
         f"step_embed_max_steps={latent_moe.step_embed_max_steps}, "
+        f"expert_dropout={latent_moe.expert_dropout}, "
         f"context_type={context_type}, "
         f"balance_loss_weight={float(getattr(model_args, 'latent_moe_balance_loss_weight', 0.0))}"
     )
@@ -1560,14 +1746,33 @@ def load_qwen_model_with_fallback(
         else Qwen2VLForConditionalGeneration
     )
 
+    def _load_model(requested_attn_implementation: str):
+        try:
+            return model_cls.from_pretrained(
+                model_name_or_path,
+                cache_dir=cache_dir,
+                attn_implementation=requested_attn_implementation,
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
+            )
+        except ValueError as e:
+            err_msg = str(e).lower()
+            if "deepspeed zero-3 is not compatible with `low_cpu_mem_usage=true`" in err_msg:
+                rank0_print(
+                    "[COCONUT] Detected ZeRO-3 model load incompatibility with "
+                    "low_cpu_mem_usage=True; retry with low_cpu_mem_usage=False."
+                )
+                return model_cls.from_pretrained(
+                    model_name_or_path,
+                    cache_dir=cache_dir,
+                    attn_implementation=requested_attn_implementation,
+                    torch_dtype=torch_dtype,
+                    low_cpu_mem_usage=False,
+                )
+            raise
+
     try:
-        return model_cls.from_pretrained(
-            model_name_or_path,
-            cache_dir=cache_dir,
-            attn_implementation=attn_implementation,
-            torch_dtype=torch_dtype,
-            low_cpu_mem_usage=True,
-        ), attn_implementation
+        return _load_model(attn_implementation), attn_implementation
     except ImportError as e:
         err_msg = str(e).lower()
         if attn_implementation == "flash_attention_2" and "flash_attn" in err_msg:
@@ -1576,13 +1781,7 @@ def load_qwen_model_with_fallback(
                 "retry with attn_implementation=sdpa."
             )
             fallback_impl = "sdpa"
-            model = model_cls.from_pretrained(
-                model_name_or_path,
-                cache_dir=cache_dir,
-                attn_implementation=fallback_impl,
-                torch_dtype=torch_dtype,
-                low_cpu_mem_usage=True,
-            )
+            model = _load_model(fallback_impl)
             return model, fallback_impl
         raise
 
@@ -1620,6 +1819,16 @@ def _run_oom_precheck(
 ) -> None:
     if not bool(getattr(data_args, "coconut_enable_oom_precheck", True)):
         rank0_print("[COCONUT][PRECHECK] disabled by coconut_enable_oom_precheck=False")
+        return
+
+    force_under_ds = str(
+        os.environ.get("COCONUT_FORCE_OOM_PRECHECK_UNDER_DEEPSPEED", "0")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if _is_deepspeed_enabled(trainer.args) and (not force_under_ds):
+        rank0_print(
+            "[COCONUT][PRECHECK] skipped because DeepSpeed is enabled. "
+            "Set COCONUT_FORCE_OOM_PRECHECK_UNDER_DEEPSPEED=1 to force precheck."
+        )
         return
 
     if not torch.cuda.is_available():
@@ -1899,6 +2108,10 @@ def train(attn_implementation: str = "flash_attention_2"):
         f"[COCONUT][TRAIN] lora: enabled={model_args.use_lora}, r={model_args.lora_r}, "
         f"alpha={model_args.lora_alpha}, dropout={model_args.lora_dropout}, "
         f"use_dora={model_args.lora_use_dora}"
+    )
+    rank0_print(
+        f"[COCONUT][TRAIN] deepspeed_enabled={_is_deepspeed_enabled(training_args)}, "
+        f"deepspeed_cfg={getattr(training_args, 'deepspeed', None)}"
     )
     rank0_print(
         f"[COCONUT][TRAIN] latent_moe: enabled={model_args.latent_moe_enable}, "

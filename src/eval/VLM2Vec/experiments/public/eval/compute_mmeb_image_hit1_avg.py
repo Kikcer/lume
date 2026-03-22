@@ -117,7 +117,7 @@ def main() -> None:
         "--score_dir",
         type=Path,
         default=Path(
-            "output/Eval/UME-R1-2B-Coconut-Fulldata-8node-2026-03-08-21-00-10_checkpoint-2862/image-gen"
+            "/home/guohaiyun/yangtianyu/UME-R1/output/Eval/UME-R1-2B-Coconut-Fulldata-NoAns-4node-2026-03-10-10-03-52_checkpoint-1431/image-gen"
         ),
         help="Directory containing *_gen_gen_score.json files.",
     )

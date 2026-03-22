@@ -16,9 +16,10 @@ set -euo pipefail
 # ---------- Cluster topology ----------
 MASTER_ADDR="${MASTER_ADDR:-192.168.100.113}"
 MASTER_PORT="${MASTER_PORT:-29500}"
-NNODES="${NNODES:-4}"
+NNODES="${NNODES:-8}"
 NODE_RANK="${NODE_RANK:-0}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 
 # ---------- Paths (GPFS shared) ----------
 WORK_DIR="/home/guohaiyun/yangtianyu/UME-R1"
@@ -26,15 +27,15 @@ MODEL_PATH="${MODEL_PATH:-/home/share/yty_model/UME-R1/2B/UME-R1/2B}"
 ANNOTATION_PATH="${ANNOTATION_PATH:-/home/share/yty_data/UME_R1_train/UME-sft-train.jsonl}"
 MEDIA_ROOT="${MEDIA_ROOT:-/home/share/yty_data/vlm2vec_train}"
 # SUBSET_FILTER="${SUBSET_FILTER:-CIRR,MSCOCO_t2i,WebQA,ImageNet-1K,RefCOCO,InfographicsVQA}"  # empty = ALL datasets
-SUBSET_FILTER="${SUBSET_FILTER:-InfographicsVQA}"
+SUBSET_FILTER="${SUBSET_FILTER:-}"
 # ---------- Training hyperparams ----------
 # 8 nodes × 8 GPUs = 64 GPUs
 # effective_global_batch = 2 * 4 * 64 = 512
 # contrastive_batch (per step) = 2 * 64 = 128
-PER_DEVICE_BS="${PER_DEVICE_BS:-8}"
+PER_DEVICE_BS="${PER_DEVICE_BS:-4}"
 GRAD_ACC="${GRAD_ACC:-4}"
 LR="${LR:-5e-5}"
-EPOCHS="${EPOCHS:-5}"
+EPOCHS="${EPOCHS:-2}"
 MAX_LEN="${MAX_LEN:-12288}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
@@ -43,7 +44,7 @@ WEIGHT_DECAY="${WEIGHT_DECAY:-0}"
 MAX_PIXELS="${MAX_PIXELS:-2359296}"                  # 28*28*576
 MIN_PIXELS="${MIN_PIXELS:-768}"                  # 28*28*16 (match original)
 VIDEO_MAX_FRAME_PIXELS="${VIDEO_MAX_FRAME_PIXELS:-2359296}"  # 32*28*28
-VIDEO_MIN_FRAME_PIXELS="${VIDEO_MIN_FRAME_PIXELS:-784}"   # 4*28*28
+VIDEO_MIN_FRAME_PIXELS="${VIDEO_MIN_FRAME_PIXELS:-768}"   # 4*28*28
 
 LORA_R="${LORA_R:-16}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
@@ -55,12 +56,14 @@ LATENT_MOE_USE_SHARED_EXPERT="${LATENT_MOE_USE_SHARED_EXPERT:-True}"
 LATENT_MOE_BALANCE_LOSS_WEIGHT="${LATENT_MOE_BALANCE_LOSS_WEIGHT:-0.1}"
 LATENT_MOE_STEP_EMBED_MAX_STEPS="${LATENT_MOE_STEP_EMBED_MAX_STEPS:-32}"
 LATENT_MOE_CONTEXT_TYPE="${LATENT_MOE_CONTEXT_TYPE:-disc}"
+LATENT_MOE_EXPERT_DROPOUT="${LATENT_MOE_EXPERT_DROPOUT:-0.1}"
 
-THINK_SEGMENTS="${THINK_SEGMENTS:-4}"
+THINK_SEGMENTS="${THINK_SEGMENTS:-6}"
 CT_PER_SEG="${CT_PER_SEG:-1}"
 SAMPLING_STRATEGY="${SAMPLING_STRATEGY:-subset_balanced}"
 FINAL_STAGE_PORTION="${FINAL_STAGE_PORTION:-0.5}"
 LATENT_ANSWER_IN_FINAL_HALF="${LATENT_ANSWER_IN_FINAL_HALF:-True}"
+
 FINAL_STAGE_ANSWER_PORTION="${FINAL_STAGE_ANSWER_PORTION:-0.5}"
 
 GEN_CONTRASTIVE_W="${GEN_CONTRASTIVE_W:-1.0}"
@@ -71,11 +74,36 @@ SAVE_STEPS="${SAVE_STEPS:-200}"
 LOG_STEPS="${LOG_STEPS:-10}"
 WANDB_MODE="${WANDB_MODE:-disabled}"
 
-OUTPUT_DIR="${OUTPUT_DIR:-output/UME-R1-2B-Coconut-FullData-8node-$(date +%Y-%m-%d-%H-%M-%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-output/test/UME-R1-2B-Coconut-InfoVQA-NoAns-2node-moe-1epoch$(date +%Y-%m-%d-%H-%M-%S)}"
+USE_DEEPSPEED="${USE_DEEPSPEED:-0}"
+DEEPSPEED_CFG="${DEEPSPEED_CFG:-${WORK_DIR}/src/sft-train/scripts/zero3.json}"
 
-# ---------- NCCL tuning ----------
-export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"       # disable IB, use TCP socket (IB has connectivity issues across nodes)
-export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-bond0}"  # TCP via bond0 (192.168.100.x)
+# ---------- Communication profile ----------
+# Profiles:
+#   tcp_stable (default): current safe setup over TCP/bond0
+#   tcp_fast           : more aggressive TCP channels/threads
+#   rdma_fast          : prefer IB/RDMA (if fabric is healthy)
+COMM_PROFILE="${COMM_PROFILE:-tcp_stable}"
+COMM_PROFILE_LC="$(echo "${COMM_PROFILE}" | tr '[:upper:]' '[:lower:]')"
+
+detect_active_ib_hcas() {
+    local out=()
+    local dev state link
+    for dev_path in /sys/class/infiniband/*; do
+        [ -d "${dev_path}" ] || continue
+        dev="$(basename "${dev_path}")"
+        state="$(cat "${dev_path}/ports/1/state" 2>/dev/null || true)"
+        link="$(cat "${dev_path}/ports/1/link_layer" 2>/dev/null || true)"
+        if [[ "${state}" == *"ACTIVE"* && "${link}" == "InfiniBand" ]]; then
+            out+=("${dev}")
+        fi
+    done
+    if [ "${#out[@]}" -gt 0 ]; then
+        local IFS=,
+        echo "${out[*]}"
+    fi
+}
+
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
 export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-1}"
@@ -83,16 +111,46 @@ export NCCL_TIMEOUT="${NCCL_TIMEOUT:-3600}"
 # H20 + NCCL 2.27 may occasionally hang on NVLS/CUMEM paths in large multi-node setups.
 export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
-# Reduce channel fanout to lower socket/collective complexity for 64-rank bring-up.
-export NCCL_MIN_NCHANNELS="${NCCL_MIN_NCHANNELS:-1}"
-export NCCL_MAX_NCHANNELS="${NCCL_MAX_NCHANNELS:-4}"
-# Multi-thread / multi-socket to reduce per-connection pressure over TCP
-export NCCL_SOCKET_NTHREADS="${NCCL_SOCKET_NTHREADS:-4}"
-export NCCL_NSOCKS_PERTHREAD="${NCCL_NSOCKS_PERTHREAD:-4}"
 export NCCL_BUFFSIZE="${NCCL_BUFFSIZE:-8388608}"       # 8MB buffer, fewer small packets
 export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-OFF}"
-# Force Gloo (used by DDP for CPU collectives / monitoredBarrier) to use bond0 only
-export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-bond0}"
+
+case "${COMM_PROFILE_LC}" in
+    rdma_fast)
+        # Use IB/RDMA for collectives; keep socket iface for bootstrap/Gloo.
+        export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
+        export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-bond0}"
+        export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-bond0}"
+        export NCCL_MIN_NCHANNELS="${NCCL_MIN_NCHANNELS:-4}"
+        export NCCL_MAX_NCHANNELS="${NCCL_MAX_NCHANNELS:-16}"
+        export NCCL_SOCKET_NTHREADS="${NCCL_SOCKET_NTHREADS:-4}"
+        export NCCL_NSOCKS_PERTHREAD="${NCCL_NSOCKS_PERTHREAD:-4}"
+        export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-2}"
+        if [ -z "${NCCL_IB_HCA:-}" ]; then
+            DETECTED_IB_HCA="$(detect_active_ib_hcas || true)"
+            if [ -n "${DETECTED_IB_HCA}" ]; then
+                export NCCL_IB_HCA="${DETECTED_IB_HCA}"
+            fi
+        fi
+        ;;
+    tcp_fast)
+        export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+        export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-bond0}"
+        export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-bond0}"
+        export NCCL_MIN_NCHANNELS="${NCCL_MIN_NCHANNELS:-2}"
+        export NCCL_MAX_NCHANNELS="${NCCL_MAX_NCHANNELS:-8}"
+        export NCCL_SOCKET_NTHREADS="${NCCL_SOCKET_NTHREADS:-8}"
+        export NCCL_NSOCKS_PERTHREAD="${NCCL_NSOCKS_PERTHREAD:-4}"
+        ;;
+    tcp_stable|*)
+        export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+        export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-bond0}"
+        export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-bond0}"
+        export NCCL_MIN_NCHANNELS="${NCCL_MIN_NCHANNELS:-1}"
+        export NCCL_MAX_NCHANNELS="${NCCL_MAX_NCHANNELS:-4}"
+        export NCCL_SOCKET_NTHREADS="${NCCL_SOCKET_NTHREADS:-4}"
+        export NCCL_NSOCKS_PERTHREAD="${NCCL_NSOCKS_PERTHREAD:-4}"
+        ;;
+esac
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 # TCP keepalive: detect dead peers faster instead of hanging forever
@@ -109,7 +167,10 @@ echo "[MULTINODE] node_rank=${NODE_RANK}/${NNODES}, master=${MASTER_ADDR}:${MAST
 echo "[MULTINODE] total_gpus=${TOTAL_GPUS}, per_device_bs=${PER_DEVICE_BS}, grad_acc=${GRAD_ACC}"
 echo "[MULTINODE] effective_global_batch=${GLOBAL_BATCH}, contrastive_batch=${CONTRASTIVE_BATCH}"
 echo "[MULTINODE] pixels image=${MIN_PIXELS}~${MAX_PIXELS}, video_frame=${VIDEO_MIN_FRAME_PIXELS}~${VIDEO_MAX_FRAME_PIXELS}"
-echo "[MULTINODE] latent_moe enable=${LATENT_MOE_ENABLE}, experts=${LATENT_MOE_NUM_EXPERTS}, top_k=${LATENT_MOE_TOP_K}, ctx=${LATENT_MOE_CONTEXT_TYPE}, balance_w=${LATENT_MOE_BALANCE_LOSS_WEIGHT}"
+echo "[MULTINODE] latent_moe enable=${LATENT_MOE_ENABLE}, experts=${LATENT_MOE_NUM_EXPERTS}, top_k=${LATENT_MOE_TOP_K}, ctx=${LATENT_MOE_CONTEXT_TYPE}, balance_w=${LATENT_MOE_BALANCE_LOSS_WEIGHT}, expert_dropout=${LATENT_MOE_EXPERT_DROPOUT}"
+echo "[MULTINODE] deepspeed use=${USE_DEEPSPEED}, cfg=${DEEPSPEED_CFG}"
+echo "[MULTINODE] comm_profile=${COMM_PROFILE_LC}, NCCL_IB_DISABLE=${NCCL_IB_DISABLE}, NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME}, NCCL_MIN_NCHANNELS=${NCCL_MIN_NCHANNELS}, NCCL_MAX_NCHANNELS=${NCCL_MAX_NCHANNELS}"
+echo "[MULTINODE] NCCL_IB_HCA=${NCCL_IB_HCA:-<auto-or-unset>}"
 echo "[MULTINODE] output_dir=${OUTPUT_DIR}"
 echo "============================================="
 
@@ -122,14 +183,22 @@ if [ -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
     conda activate ume-r1
 fi
 
+DEEPSPEED_ARGS=()
+case "${USE_DEEPSPEED,,}" in
+    1|true|yes|on)
+        DEEPSPEED_ARGS=(--deepspeed "${DEEPSPEED_CFG}")
+        ;;
+esac
+
 WANDB_MODE="${WANDB_MODE}" \
-torchrun \
+"${TORCHRUN_BIN}" \
   --nnodes="${NNODES}" \
   --nproc_per_node="${NPROC_PER_NODE}" \
   --node_rank="${NODE_RANK}" \
   --master_addr="${MASTER_ADDR}" \
   --master_port="${MASTER_PORT}" \
   src/sft-train/qwenvl/train/train_qwen_coconut_gc.py \
+  "${DEEPSPEED_ARGS[@]}" \
   --model_name_or_path "${MODEL_PATH}" \
   --output_dir "${OUTPUT_DIR}" \
   --attn_implementation flash_attention_2 \
@@ -151,7 +220,7 @@ torchrun \
   --gradient_checkpointing True \
   --max_grad_norm 1 \
   --dataloader_num_workers 0 \
-  --save_total_limit 10 \
+  --save_total_limit 20 \
   --use_lora False \
   --latent_moe_enable "${LATENT_MOE_ENABLE}" \
   --latent_moe_num_experts "${LATENT_MOE_NUM_EXPERTS}" \
@@ -160,6 +229,7 @@ torchrun \
   --latent_moe_balance_loss_weight "${LATENT_MOE_BALANCE_LOSS_WEIGHT}" \
   --latent_moe_step_embed_max_steps "${LATENT_MOE_STEP_EMBED_MAX_STEPS}" \
   --latent_moe_context_type "${LATENT_MOE_CONTEXT_TYPE}" \
+  --latent_moe_expert_dropout "${LATENT_MOE_EXPERT_DROPOUT}" \
   --tune_mm_llm True \
   --tune_mm_mlp True \
   --tune_mm_vision False \

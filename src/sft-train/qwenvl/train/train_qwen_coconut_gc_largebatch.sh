@@ -10,17 +10,17 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 WORK_DIR="${WORK_DIR:-/home/guohaiyun/yangtianyu/UME-R1}"
 
-MODEL_PATH="${MODEL_PATH:-/home/share/yty_model/UME-R1/2B/UME-R1/2B}"
+MODEL_PATH="${MODEL_PATH:-/home/share/yty_model/UME-R1/7B}"
 ANNOTATION_PATH="${ANNOTATION_PATH:-/home/share/yty_data/UME_R1_train/UME-sft-train.jsonl}"
 MEDIA_ROOT="${MEDIA_ROOT:-/home/share/yty_data/vlm2vec_train}"
-SUBSET_FILTER="${SUBSET_FILTER:-InfographicsVQA}"
+SUBSET_FILTER="${SUBSET_FILTER:-}"
 MAX_PIXELS="${MAX_PIXELS:-2359296}"                  # 28*28*576
 MIN_PIXELS="${MIN_PIXELS:-768}"     
-PER_DEVICE_BS="${PER_DEVICE_BS:-16}"
+PER_DEVICE_BS="${PER_DEVICE_BS:-1}"
 GRAD_ACC="${GRAD_ACC:-1}"
-LR="${LR:-2e-5}"
-EPOCHS="${EPOCHS:-5}"
-MAX_LEN="${MAX_LEN:-12288}"
+LR="${LR:-1e-5}"
+EPOCHS="${EPOCHS:-1}"
+MAX_LEN="${MAX_LEN:-11288}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0}"
@@ -54,7 +54,9 @@ WANDB_MODE="${WANDB_MODE:-disabled}"
 COCONUT_ENABLE_OOM_PRECHECK="${COCONUT_ENABLE_OOM_PRECHECK:-False}"
 COCONUT_OOM_PRECHECK_BATCHES="${COCONUT_OOM_PRECHECK_BATCHES:-1}"
 
-OUTPUT_DIR="${OUTPUT_DIR:-${WORK_DIR}/output/UME-R1-2B-Coconut-GC-Info-Continue-$(date +%Y-%m-%d-%H-%M-%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-${WORK_DIR}/output/test/UME-R1-7B-Coconut-GC-Info-Continue-$(date +%Y-%m-%d-%H-%M-%S)}"
+USE_DEEPSPEED="${USE_DEEPSPEED:-1}"
+DEEPSPEED_CFG="${DEEPSPEED_CFG:-${WORK_DIR}/src/sft-train/scripts/zero3.json}"
 
 # NCCL stability knobs (aligned with multinode launcher defaults).
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
@@ -70,6 +72,7 @@ export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-OFF}"
 GLOBAL_BATCH=$(( PER_DEVICE_BS * GRAD_ACC * NPROC_PER_NODE ))
 echo "[COCONUT-GC-LAUNCH] nproc=${NPROC_PER_NODE}, per_device_bs=${PER_DEVICE_BS}, grad_acc=${GRAD_ACC}, effective_global_batch=${GLOBAL_BATCH}"
 echo "[COCONUT-GC-LAUNCH] latent_moe enable=${LATENT_MOE_ENABLE}, experts=${LATENT_MOE_NUM_EXPERTS}, top_k=${LATENT_MOE_TOP_K}, ctx=${LATENT_MOE_CONTEXT_TYPE}, balance_w=${LATENT_MOE_BALANCE_LOSS_WEIGHT}"
+echo "[COCONUT-GC-LAUNCH] deepspeed use=${USE_DEEPSPEED}, cfg=${DEEPSPEED_CFG}"
 echo "[COCONUT-GC-LAUNCH] output_dir=${OUTPUT_DIR}"
 echo "[COCONUT-GC-LAUNCH] work_dir=${WORK_DIR}"
 echo "[COCONUT-GC-LAUNCH] pwd(before cd)=$(pwd)"
@@ -78,9 +81,17 @@ cd "${WORK_DIR}"
 mkdir -p "${OUTPUT_DIR}"
 echo "[COCONUT-GC-LAUNCH] pwd(after cd)=$(pwd)"
 
+DEEPSPEED_ARGS=()
+case "${USE_DEEPSPEED,,}" in
+  1|true|yes|on)
+    DEEPSPEED_ARGS=(--deepspeed "${DEEPSPEED_CFG}")
+    ;;
+esac
+
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" WANDB_MODE="${WANDB_MODE}" \
 "${TORCHRUN_BIN}" --nproc_per_node="${NPROC_PER_NODE}" \
   src/sft-train/qwenvl/train/train_qwen_coconut_gc.py \
+  "${DEEPSPEED_ARGS[@]}" \
   --model_name_or_path "${MODEL_PATH}" \
   --output_dir "${OUTPUT_DIR}" \
   --attn_implementation flash_attention_2 \
@@ -118,7 +129,7 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" WANDB_MODE="${WANDB_MODE}" \
   --coconut_media_root "${MEDIA_ROOT}" \
   --coconut_use_qry True \
   --coconut_use_pos True \
-  --coconut_curriculum_stages 0.25,0.5,1.0 \
+  --coconut_curriculum_stages 0 \
   --coconut_think_segments "${THINK_SEGMENTS}" \
   --coconut_final_stage_portion "${FINAL_STAGE_PORTION}" \
   --coconut_latent_answer_in_final_half "${LATENT_ANSWER_IN_FINAL_HALF}" \

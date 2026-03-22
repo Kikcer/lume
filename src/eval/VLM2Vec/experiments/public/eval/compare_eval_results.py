@@ -2,8 +2,8 @@
 """
 比较两个评测结果文件夹中的hit@1指标 
 python src/eval/VLM2Vec/experiments/public/eval/compare_eval_results.py \
-    output/Eval/UME-R1-2B-Coconut-Fulldata-4node-2026-03-05-20-02-40_checkpoint-1429/image-gen \
-    output/Eval/UME-R1-2B-Coconut-Fulldata-8node-2026-03-08-21-00-10_checkpoint-2862/image-gen
+    output/Eval/UME-R1_2B/UME-R1-2B-Coconut-Fulldata-NoAns-4node-2026-03-10-10-03-52_checkpoint-1431/image-gen \
+    output/Eval/UME-R1-2B-Coconut-Fulldata-NoAns-4node-2026-03-10-10-03-52_checkpoint-1431/image-gen
     
 """
 import json

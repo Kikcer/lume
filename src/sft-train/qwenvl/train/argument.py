@@ -59,6 +59,10 @@ class ModelArguments:
             "help": "Router context source for latent MoE. One of: none, prefix_last, disc."
         },
     )
+    latent_moe_expert_dropout: float = field(
+        default=0.0,
+        metadata={"help": "Dropout probability inside each latent MoE expert MLP."},
+    )
 
 
 @dataclass

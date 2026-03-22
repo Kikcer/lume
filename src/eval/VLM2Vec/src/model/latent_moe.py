@@ -103,6 +103,8 @@ class LatentMoETransition(nn.Module):
 
         topk_prob, topk_idx = torch.topk(gate_probs, k=self.top_k, dim=-1)
         u = self.ln(z_t)
+        if u.is_floating_point() and u.dtype != z_t.dtype:
+            u = u.to(dtype=z_t.dtype)
 
         if self.shared_expert is not None:
             mixed = self.shared_expert(u)
@@ -112,15 +114,20 @@ class LatentMoETransition(nn.Module):
         expert_mix = torch.zeros_like(u)
         for k_idx in range(self.top_k):
             idx_k = topk_idx[:, k_idx]
-            prob_k = topk_prob[:, k_idx].unsqueeze(-1)
+            prob_k = topk_prob[:, k_idx].unsqueeze(-1).to(dtype=u.dtype)
             out_k = torch.zeros_like(u)
             for expert_id, expert in enumerate(self.experts):
                 mask = idx_k == expert_id
                 if mask.any():
-                    out_k[mask] = expert(u[mask])
+                    expert_out = expert(u[mask])
+                    if expert_out.dtype != out_k.dtype:
+                        expert_out = expert_out.to(dtype=out_k.dtype)
+                    out_k[mask] = expert_out
             expert_mix = expert_mix + prob_k * out_k
 
         mixed = mixed + expert_mix
+        if mixed.is_floating_point() and mixed.dtype != z_t.dtype:
+            mixed = mixed.to(dtype=z_t.dtype)
         z_out = z_t + mixed
 
         avg_prob = gate_probs.mean(dim=0)
